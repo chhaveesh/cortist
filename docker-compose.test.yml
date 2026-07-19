@@ -1,0 +1,40 @@
+# Isolated backing services for the automated test suite.
+#
+# Deliberately separate from docker-compose.yml so running tests can never
+# touch local dev data:
+#   - its own compose project name (`cortist-test`, set in scripts/test-e2e.sh)
+#   - non-default host ports, so it can run alongside the dev stack
+#   - tmpfs storage and no volumes, so every run starts from a clean slate
+#
+# The app itself is NOT containerised here: Jest boots the Nest gateway and
+# worker in-process, which makes assertions on the queue and database direct
+# and keeps the suite fast to iterate on.
+
+services:
+  postgres-test:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: cortist_test
+      POSTGRES_PASSWORD: cortist_test
+      POSTGRES_DB: cortist_test
+    ports:
+      - '55432:5432'
+    tmpfs:
+      - /var/lib/postgresql/data
+    healthcheck:
+      test: ['CMD-SHELL', 'pg_isready -U cortist_test -d cortist_test']
+      interval: 2s
+      timeout: 3s
+      retries: 30
+
+  redis-test:
+    image: redis:7-alpine
+    # No persistence: state must not survive between runs.
+    command: ['redis-server', '--save', '', '--appendonly', 'no']
+    ports:
+      - '56379:6379'
+    healthcheck:
+      test: ['CMD', 'redis-cli', 'ping']
+      interval: 2s
+      timeout: 3s
+      retries: 30

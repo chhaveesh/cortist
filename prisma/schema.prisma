@@ -1,0 +1,41 @@
+// Cortist Phase 1 data model.
+//
+// Deliberately minimal: the only durable state this phase owns is the mapping
+// from a Telegram identity to an internal tenant, plus a marker table the stub
+// worker writes to so the end-to-end pipe is observable from tests.
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+/// One row per onboarded Telegram user. `id` is the internal tenant identifier
+/// that every downstream agent (Phase 2+) should key off — never the Telegram id.
+model User {
+  id             String   @id @default(uuid()) @db.Uuid
+  telegramUserId BigInt   @unique @map("telegram_user_id")
+  telegramChatId BigInt   @map("telegram_chat_id")
+  createdAt      DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+
+  @@map("users")
+}
+
+/// Written by the stub worker to prove gateway -> queue -> worker delivery.
+/// Phase 2 will replace this with real agent output; the unique constraint on
+/// (chat_id, message_id) also acts as a durable backstop against double
+/// processing if the Redis dedupe key has already expired.
+model ProcessedMessage {
+  id          String   @id @default(uuid()) @db.Uuid
+  tenantId    String   @map("tenant_id") @db.Uuid
+  chatId      BigInt   @map("chat_id")
+  messageId   Int      @map("message_id")
+  text        String
+  processedAt DateTime @default(now()) @map("processed_at") @db.Timestamptz(6)
+
+  @@unique([chatId, messageId], map: "processed_messages_chat_id_message_id_key")
+  @@map("processed_messages")
+}

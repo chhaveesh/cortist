@@ -1,6 +1,7 @@
 import { Injectable, Logger } from '@nestjs/common';
 import { Job } from 'bullmq';
 import { Prisma } from '@prisma/client';
+import { CalendarAgentService } from '../agents/calendar/calendar-agent.service';
 import {
   TelegramMessageJob,
   telegramMessageJobSchema,
@@ -8,17 +9,21 @@ import {
 import { PrismaService } from '../prisma/prisma.service';
 
 /**
- * PHASE 1 STUB.
+ * Consumes queued Telegram messages and dispatches them to the calendar agent.
  *
- * Proves the gateway -> queue -> worker pipe by logging the job and writing a
- * durable marker row. Phase 2 replaces the body of `handle()` with agent
- * routing; the validation and idempotency scaffolding around it should stay.
+ * There is no general router yet — every message goes to the one agent that
+ * exists, which classifies it and ignores anything non-calendar. A later phase
+ * replaces this single call with routing across agents; the validation and
+ * marker scaffolding around it stays.
  */
 @Injectable()
 export class TelegramMessageProcessor {
   private readonly logger = new Logger(TelegramMessageProcessor.name);
 
-  constructor(private readonly prisma: PrismaService) {}
+  constructor(
+    private readonly prisma: PrismaService,
+    private readonly calendarAgent: CalendarAgentService,
+  ) {}
 
   async process(job: Job): Promise<void> {
     // Re-validate at the consumer boundary. The producer is trusted today, but
@@ -45,6 +50,20 @@ export class TelegramMessageProcessor {
     this.logger.log(
       `Processing message ${payload.messageId} from chat ${payload.chatId} ` +
         `for tenant ${payload.tenantId}: ${JSON.stringify(payload.text)}`,
+    );
+
+    // Agent first, marker second — the ordering matters.
+    //
+    // Marker-first would let the P2002 branch below short-circuit a retry and
+    // skip the agent entirely, silently dropping the message. Agent-first is
+    // safe because CalendarAgentService rethrows only on `rate_limited`, and a
+    // rate-limited call never executed — so a retry cannot duplicate an event.
+    // Every other calendar failure returns an outcome instead of throwing, so
+    // it never triggers a BullMQ retry in the first place.
+    const outcome = await this.calendarAgent.handle(payload);
+
+    this.logger.log(
+      `Calendar agent outcome for message ${payload.messageId}: ${outcome.status}`,
     );
 
     try {

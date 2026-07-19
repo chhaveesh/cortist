@@ -368,3 +368,240 @@ The Phase 1 deferrals above stand, minus what this pass covered. Specifically
 still open: rate limiting, a dedicated dead-letter queue with alerting (failed
 jobs are retained and visible, but nothing pages), structured JSON logging and
 trace correlation, non-text message handling, and outbound Telegram replies.
+
+---
+
+# Phase 2 — Calendar agent
+
+## 20. AES-256-GCM, not KMS
+
+**Chosen: AES-256-GCM with a key from `TOKEN_ENCRYPTION_KEY`.**
+
+The spec said KMS if AWS credentials were available. They are not — no `~/.aws`,
+no `AWS_*` environment — so envelope encryption via KMS would have been
+untestable here and unrunnable by anyone cloning the repo.
+
+GCM rather than CBC because it authenticates: a tampered row fails to decrypt
+instead of yielding attacker-influenced plaintext. A fresh random 96-bit IV per
+encryption is mandatory — reusing one under the same key leaks the keystream and
+breaks GCM outright, which is why `encrypt()` never accepts a caller-supplied IV
+and a test asserts two encryptions of the same input differ.
+
+The envelope is `v1:<iv>:<tag>:<ciphertext>`. The version prefix means a future
+move to KMS can decrypt existing `v1` rows during migration instead of orphaning
+them — the natural upgrade path is a `v2` prefix holding a KMS-wrapped data key.
+
+Rotating the key makes every stored token undecryptable and forces all users to
+reconnect. That is documented in `.env.example` rather than mitigated: key
+rotation with re-encryption is a real feature, and pretending otherwise would be
+worse than saying so.
+
+## 21. Claude Haiku 4.5 for intent parsing
+
+**Chosen: `claude-haiku-4-5` via the Anthropic SDK.**
+
+No LLM provider was configured, so this was a free choice. Haiku 4.5 is cheap
+($1/$5 per MTok), fast enough to sit in a message path, supports structured
+outputs, and keeps the project on one vendor. The spec named `gpt-4o-mini` "or
+equivalent"; this is the equivalent.
+
+Cost is bounded by design: one classification per message that survives the
+pre-filter, at ~500 input tokens. `max_tokens` is 2048 — this is extraction of a
+few short strings, and a low ceiling stops a runaway generation.
+
+The provider sits behind `CalendarIntentClassifier`, so switching is one new
+implementation and a changed `useClass`.
+
+## 22. Flat wire schema, narrowed to a domain union
+
+The model fills a **flat object** with every field required; the agent works
+with a **discriminated union**. `narrowIntent()` bridges them.
+
+Sending the union directly was the obvious approach and was rejected. Structured
+outputs supports `anyOf`, but a flat all-required object is markedly more
+reliable for a small model, and it degrades better: a model that fills the wrong
+field for its chosen intent produces a validation miss we can turn into a
+clarifying question, rather than a schema violation that fails the whole call.
+
+The union is still where correctness lives — `narrowIntent` enforces the
+per-intent required fields the flat schema cannot express, so invalid
+combinations never reach the agent. When a required field is missing, it
+**downgrades to `needs_clarification` rather than guessing**. Guessing a time or
+a title is exactly how you end up with a wrong entry in someone's real calendar
+that they have to notice and undo.
+
+**Two schema declarations, cross-checked.** The SDK's `zodOutputFormat` helper
+targets Zod v4; this project is on Zod v3, which Phase 1 uses throughout.
+Upgrading Zod under working code for one call site was not worth it, so the wire
+contract is written as literal JSON Schema (`jsonSchemaOutputFormat`) and Zod
+validates the response. `calendar-intent.schema.spec.ts` asserts the two agree
+on field names, required-ness, and the absence of constraint keywords that
+structured outputs rejects — so they cannot drift silently.
+
+## 23. The model never sees an event id
+
+For reschedule and delete the model emits an `eventQuery` (title words plus a
+time window); we resolve it against the real calendar.
+
+This is what makes *"reschedule my call"* work when the user has three calls
+today. Resolution has three outcomes — none, one, several — and only the middle
+one proceeds. Several produces a numbered list and a question. A model asked to
+produce an id would have had to invent one.
+
+## 24. Timezone from the events.list response
+
+`events.list` returns the calendar's `timeZone`, so relative phrases resolve
+correctly without requesting `calendar.settings.readonly` on top of
+`calendar.events`. One fewer scope on the consent screen, for a field we were
+already fetching.
+
+## 25. Pending actions in Postgres, resolved before confirmation
+
+**Chosen: a `pending_actions` table, unique on `user_id`.**
+
+Redis with a TTL was the alternative and would have been less code. Postgres was
+chosen for durability and inspectability: an unanswered confirmation surviving a
+Redis restart is the safer failure direction, and being able to query what a
+tenant was asked is worth having. Expiry is enforced **on read** rather than by a
+sweeper, so a delayed cleanup can never resurrect a stale confirmation.
+
+**The event id is resolved before the record is written, not after the "yes".**
+If we stored only the user's words and resolved them on confirmation, a calendar
+that changed in between could make "yes" delete a different event than the one
+named in the prompt.
+
+Unique on `user_id` means a new request supersedes an unanswered one. If a user
+asks to delete A, then asks to delete B, their "yes" clearly refers to B.
+
+**Deciding what supersedes uses the classifier, not the keyword filter.** The
+first implementation gated this on `looksCalendarRelated()`, which was wrong: the
+filter is a recall-tuned heuristic, and letting a false positive discard a
+pending confirmation hangs a destructive-action decision on a guess. It was
+caught by the filter matching "maybe" (see §26). Now an unclear reply is
+classified properly, and only an actionable intent supersedes.
+
+Confirmation replies are interpreted **deterministically**, not by the LLM: the
+ways people say yes and no form a small closed set, the user is waiting, and a
+model that hallucinated "affirmative" would delete a real event. Negatives are
+checked before affirmatives, so *"no, cancel it"* — which contains the
+affirmative phrase "cancel it" — reads as a refusal. On a destructive action the
+safe misreading is to decline.
+
+## 26. The keyword pre-filter, and what it costs
+
+A regex pre-filter runs before the LLM call. This was a deliberate choice against
+the recommendation, and the tradeoff is real: it saves one small model call per
+non-calendar message, at the cost of silently dropping any calendar request
+phrased without a listed keyword. **Recall is the side that fails invisibly** —
+the user just gets no reply.
+
+Two mitigations: the list is generous (verbs, nouns, weekdays, months, time
+expressions), and `calendar-keyword-filter.spec.ts` has a test that explicitly
+pins three known false negatives so the blind spot is visible in review rather
+than discovered in production.
+
+**A false-positive bug found in review.** The month pattern was
+`(jan|feb|mar|…|may|…)[a-z]*` — a prefix match that also fires on "maybe",
+"decide", "separate", "market", and "jungle". It surfaced when "hmm maybe"
+matched and discarded a pending delete confirmation. Fixed by listing month
+names and abbreviations explicitly, with a regression test. The deeper lesson is
+recorded in §25: the filter is not a signal to hang decisions on.
+
+The general router in a later phase replaces this outright.
+
+## 27. Create executes; delete and reschedule confirm
+
+The spec asked whether create-without-confirmation is reasonable. It is.
+
+Creating is additive, conflict-checked, and trivially undone, and the summary
+sent afterwards makes a mistake immediately visible. Deleting destroys data.
+Rescheduling moves a commitment other people may have planned around — which is
+why it is gated too, rather than treated as a benign edit.
+
+Conflict detection uses **half-open intervals**: an event ending exactly as
+another begins does not clash, because back-to-back meetings are normal and
+flagging them would make the agent unusable for anyone with a full day. All-day
+events are ignored — treating a "Public Holiday" as a conflict would block every
+booking that day. A rescheduled event is excluded from its own conflict check,
+or it would always clash with its current slot.
+
+## 28. Agent before marker in the worker
+
+`TelegramMessageProcessor` dispatches to the agent **first**, then writes the
+`processed_messages` row.
+
+Marker-first would let the `P2002` duplicate branch short-circuit a retry and
+skip the agent entirely, silently dropping the message. Agent-first is safe
+because `CalendarAgentService` rethrows **only** on `rate_limited` — and a
+rate-limited call never executed, so a retry cannot duplicate an event. Every
+other calendar failure returns an outcome instead of throwing, so it never
+triggers a BullMQ retry at all. Create is the only non-idempotent operation, and
+that is precisely the path a rate limit leaves untouched.
+
+The marker write stays: it is idempotency layer 3 from §4 and the assertion
+target for the Phase 1 pipe tests.
+
+## 29. Test doubles at four provider tokens
+
+`test/calendar-harness.ts` overrides `CalendarClient`,
+`CalendarIntentClassifier`, `GoogleOAuthClient`, and `TelegramSenderService`.
+
+Those are the code's only routes to Google, Anthropic, and Telegram, so "no real
+network calls in CI" is a structural property rather than a testing convention —
+reaching the network would require deliberately binding the real implementations
+back. No API key, bot token, or tunnel is needed to run the suite.
+
+The scripted classifier **throws on an unscripted call** rather than returning a
+default: an unexpected classification means the agent took a path the test did
+not anticipate, and silently absorbing that would hide real regressions.
+
+Assertions are written around what the user was *told*, not only what was stored.
+A test that checked "no event was created" would pass even if the agent silently
+did nothing, which is a bad experience dressed up as correct behaviour.
+
+The Phase 2 harness is separate from Phase 1's so the existing webhook, pipe,
+and shutdown suites keep exercising unmodified wiring.
+
+## 30. `isolatedModules` for the test tiers
+
+Pulling the googleapis type tree into ts-jest pushed the unit suite from ~3s to
+~45s, which defeats the point of a fast tier the walkthrough expects to "take
+seconds". Per-file transpilation brings it back to ~1s. Whole-program type
+checking still happens — via `tsc --noEmit` and `npm run lint`, both of which run
+in the verification pass.
+
+## 31. A network guard, because the guarantee was wrong once
+
+`test/network-guard.ts` wraps `fetch` and the `http`/`https` modules and fails
+any test that reaches a non-localhost host.
+
+The four provider overrides in §29 were supposed to make external calls
+impossible. They did not: the Phase 1 e2e pipe test boots the **real**
+`WorkerAppModule`, and once the calendar agent was wired into the worker, that
+module graph included the real `TelegramSenderService`. The suite made a genuine
+request to `api.telegram.org` and got a 404 from the placeholder test token,
+which surfaced only as "timed out waiting for the processed_messages row" — a
+failure that pointed nowhere near the actual cause.
+
+Two fixes came out of it. The e2e worker boot now stubs the same outbound seams
+the Phase 2 harness does. And the guard turns "no real network calls" from a
+claim that has to be re-verified by reading code into a property the suite
+enforces on every run, with an error naming the host and the fix.
+
+The guard has its own tests. An untested guard is worse than none — it produces
+confidence without justification, which is precisely the failure it exists to
+prevent. Writing them found two bugs in it: a naive `/:\d+$/` port strip mangled
+IPv6 `::1` into `:`, and the `fetch` wrapper threw synchronously instead of
+rejecting, which does not match `fetch` semantics.
+
+---
+
+## Still deferred after Phase 2
+
+Recurring-event editing (the client expands instances via `singleEvents`, but
+editing a series is not modelled); attendee invitations and responses; free/busy
+negotiation beyond detect-and-report; multiple calendars per user (everything
+targets `primary`); a general multi-agent router; key rotation with
+re-encryption. The Phase 1 deferrals — rate limiting, a dead-letter queue with
+alerting, structured JSON logging with trace correlation, and non-text message
+handling — all still stand.

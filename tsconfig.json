@@ -12,6 +12,10 @@
     "baseUrl": "./",
     "incremental": true,
     "skipLibCheck": true,
+    // Per-file transpilation. Keeps the ts-jest unit tier at ~1s instead of ~45s
+    // spent building a full type program over the googleapis type tree;
+    // whole-program checking still happens via `tsc --noEmit` and `npm run lint`.
+    "isolatedModules": true,
     "strict": true,
     "strictNullChecks": true,
     "noImplicitAny": true,

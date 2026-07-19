@@ -53,6 +53,43 @@ export const envSchema = z.object({
   LOG_LEVEL: z
     .enum(['error', 'warn', 'log', 'debug', 'verbose'])
     .default('log'),
+
+  // --- Phase 2: calendar agent ---------------------------------------------
+
+  /**
+   * 32-byte AES-256-GCM key, hex-encoded (64 hex chars). Encrypts OAuth tokens
+   * at rest. Rotating it makes every stored token undecryptable, forcing users
+   * to reconnect — treat it as durable secret material.
+   */
+  TOKEN_ENCRYPTION_KEY: z
+    .string()
+    .regex(/^[0-9a-fA-F]{64}$/, 'must be 64 hex characters (32 bytes)'),
+
+  GOOGLE_CLIENT_ID: z.string().min(1),
+  GOOGLE_CLIENT_SECRET: z.string().min(1),
+
+  /**
+   * Must match a redirect URI registered in the Google Cloud console exactly,
+   * including scheme, port, and path.
+   */
+  GOOGLE_REDIRECT_URI: z.string().url(),
+
+  /** Signs the OAuth `state` parameter so callbacks cannot be forged. */
+  OAUTH_STATE_SECRET: z.string().min(16),
+
+  /** How long a generated OAuth link stays valid, in seconds. */
+  OAUTH_STATE_TTL_SECONDS: z.coerce.number().int().positive().default(900),
+
+  ANTHROPIC_API_KEY: z.string().min(1),
+
+  /** Model used for calendar intent classification and extraction. */
+  ANTHROPIC_MODEL: z.string().min(1).default('claude-haiku-4-5'),
+
+  /** How long a pending delete/reschedule waits for confirmation, in seconds. */
+  PENDING_ACTION_TTL_SECONDS: z.coerce.number().int().positive().default(300),
+
+  /** Public base URL used to build the OAuth link sent over Telegram. */
+  PUBLIC_BASE_URL: z.string().url().default('http://localhost:3000'),
 });
 
 export type Env = z.infer<typeof envSchema>;

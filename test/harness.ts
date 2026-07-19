@@ -7,6 +7,12 @@ import { registerBigIntJson } from '../src/common/bigint-json';
 import { PrismaService } from '../src/prisma/prisma.service';
 import { QUEUES } from '../src/queue/queue.constants';
 import { WorkerAppModule } from '../src/worker.module.root';
+import { CalendarClient } from '../src/agents/calendar/google/calendar.port';
+import { CalendarIntentClassifier } from '../src/agents/calendar/intent/calendar-intent.service';
+import { TelegramSenderService } from '../src/telegram/outbound/telegram-sender.service';
+import { FakeCalendarClient } from './fakes/fake-calendar.client';
+import { RecordingTelegramSender } from './fakes/recording-telegram-sender';
+import { ScriptedIntentClassifier } from './fakes/scripted-intent.classifier';
 
 registerBigIntJson();
 
@@ -84,11 +90,27 @@ export async function resetState(harness: TestHarness): Promise<void> {
  * `dist/worker.js` uses in production — so tests exercise the real consumer,
  * not a stand-in. A TestingModule is itself an application context, and
  * `init()` fires the OnModuleInit hook that starts the BullMQ worker.
+ *
+ * The three outbound seams are stubbed. Since Phase 2 the worker dispatches to
+ * the calendar agent, which talks to Telegram, Anthropic, and Google — and this
+ * tier boots the real module graph, so without these overrides the e2e run
+ * makes genuine network calls. It did: the first run after wiring the agent in
+ * hit api.telegram.org and got a 404 from the placeholder test token.
+ *
+ * These stubs are about egress only. The queue, worker lifecycle, database, and
+ * agent logic under test all remain real.
  */
 export async function startWorker(): Promise<INestApplicationContext> {
   const moduleRef = await Test.createTestingModule({
     imports: [WorkerAppModule],
-  }).compile();
+  })
+    .overrideProvider(TelegramSenderService)
+    .useValue(new RecordingTelegramSender())
+    .overrideProvider(CalendarIntentClassifier)
+    .useValue(new ScriptedIntentClassifier())
+    .overrideProvider(CalendarClient)
+    .useValue(new FakeCalendarClient())
+    .compile();
 
   return moduleRef.init();
 }

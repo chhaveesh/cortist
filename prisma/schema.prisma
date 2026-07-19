@@ -21,7 +21,51 @@ model User {
   telegramChatId BigInt   @map("telegram_chat_id")
   createdAt      DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
 
+  oauthTokens    OAuthToken[]
+  pendingAction  PendingAction?
+
   @@map("users")
+}
+
+/// One row per user per external provider. Both tokens are encrypted at rest
+/// with AES-256-GCM; nothing in this table is readable without TOKEN_ENCRYPTION_KEY.
+model OAuthToken {
+  id                    String   @id @default(uuid()) @db.Uuid
+  userId                String   @map("user_id") @db.Uuid
+  provider              String
+  accessTokenEncrypted  String   @map("access_token_encrypted")
+  /// Nullable: Google only returns a refresh token on first consent, so a
+  /// re-consent that omits it must not wipe the one we already hold.
+  refreshTokenEncrypted String?  @map("refresh_token_encrypted")
+  expiresAt             DateTime @map("expires_at") @db.Timestamptz(6)
+  createdAt             DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt             DateTime @updatedAt @map("updated_at") @db.Timestamptz(6)
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([userId, provider], map: "oauth_tokens_user_id_provider_key")
+  @@map("oauth_tokens")
+}
+
+/// A destructive action awaiting the user's explicit "yes".
+///
+/// At most one per tenant (unique on user_id): a new request supersedes any
+/// unanswered one, which matches how the conversation actually reads — the
+/// user's "yes" always refers to the most recent question asked.
+model PendingAction {
+  id        String   @id @default(uuid()) @db.Uuid
+  userId    String   @unique @map("user_id") @db.Uuid
+  /// 'delete_event' | 'reschedule_event' — see PendingActionType.
+  actionType String  @map("action_type")
+  /// The resolved, ready-to-execute action. Validated on read, never trusted.
+  payload   Json
+  expiresAt DateTime @map("expires_at") @db.Timestamptz(6)
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([expiresAt], map: "pending_actions_expires_at_idx")
+  @@map("pending_actions")
 }
 
 /// Written by the stub worker to prove gateway -> queue -> worker delivery.

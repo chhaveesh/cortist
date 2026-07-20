@@ -25,6 +25,8 @@ export class FakeCalendarClient extends CalendarClient {
   private events: CalendarEvent[] = [];
   private nextId = 1;
   private failures: Array<{ kind: CalendarErrorKind; message: string }> = [];
+  private createGate: Promise<void> | undefined;
+  private releaseCreateGate: (() => void) | undefined;
 
   /** Calls recorded in order, for asserting that nothing ran when it shouldn't. */
   readonly calls: Array<{ method: string; args: unknown }> = [];
@@ -56,6 +58,26 @@ export class FakeCalendarClient extends CalendarClient {
     this.failures.push({ kind, message });
   }
 
+  /**
+   * Holds every `createEvent` until `releaseCreates()` is called.
+   *
+   * Lets a test force a specific interleaving instead of hoping for one.
+   * Concurrency bugs that depend on incidental scheduling are exactly the kind
+   * that pass locally and fail in production — pinning the interleaving is the
+   * difference between demonstrating a race and getting lucky.
+   */
+  blockCreates(): void {
+    this.createGate = new Promise((resolve) => {
+      this.releaseCreateGate = resolve;
+    });
+  }
+
+  releaseCreates(): void {
+    this.releaseCreateGate?.();
+    this.createGate = undefined;
+    this.releaseCreateGate = undefined;
+  }
+
   setTimeZone(timeZone: string): void {
     this.timeZone = timeZone;
   }
@@ -77,6 +99,7 @@ export class FakeCalendarClient extends CalendarClient {
     this.failures = [];
     this.calls.length = 0;
     this.nextId = 1;
+    this.releaseCreates();
   }
 
   // --- CalendarClient -----------------------------------------------------
@@ -111,6 +134,10 @@ export class FakeCalendarClient extends CalendarClient {
     input: CreateEventInput,
   ): Promise<CalendarEvent> {
     this.record('createEvent', input);
+
+    // Held open by blockCreates(), so a test can line up two conflict checks
+    // before either write lands.
+    if (this.createGate) await this.createGate;
 
     const event: CalendarEvent = {
       id: `evt-${this.nextId++}`,

@@ -594,6 +594,81 @@ prevent. Writing them found two bugs in it: a naive `/:\d+$/` port strip mangled
 IPv6 `::1` into `:`, and the `fetch` wrapper threw synchronously instead of
 rejecting, which does not match `fetch` semantics.
 
+## 32. Phase 2 credentials are optional
+
+Making them required meant a missing `GOOGLE_CLIENT_ID` **crash-looped the
+gateway**. The Telegram webhook went down with it, so Telegram retried and
+eventually dropped messages — losing user input because a *calendar* credential
+was absent from a path that never touches the calendar.
+
+Fail-fast on config is right in general (§ Phase 1 env validation), but the
+blast radius has to match. Ingestion is Phase 1 functionality and must not be
+held hostage to Phase 2 setup. Now:
+
+- The gateway, queue, and worker start and run normally.
+- `CalendarConfigService` warns once at boot naming every absent variable.
+- A calendar request gets an honest "this isn't configured on my side" reply
+  rather than silence, and nothing touches Google or Anthropic.
+- `/health` reports `calendar: not_configured` with the missing names.
+
+**`/health` still returns 200 in that state**, deliberately. An unconfigured
+calendar is a setup state, not an outage; a 503 would pull a gateway that is
+happily accepting and queueing messages out of load-balancer rotation, which is
+the opposite of what the operator wants.
+
+All-or-nothing on the credential set: a half-configured integration (a Google
+client but no encryption key) fails deep inside a request with a confusing
+error. Format is still validated when a value *is* supplied — an 8-character
+encryption key is a mistake worth failing on; an absent one is a choice.
+
+## 33. Two concurrency findings
+
+Found by writing the tests the Phase 2 walkthrough asked for, and neither was
+what I expected.
+
+**Fixed — double execution of a confirmed destructive action.** The confirmation
+path did `get()` then `clear()`, which is check-then-act. Two concurrent "yes"
+replies (a double-tap, or a retried job) both read the pending row before either
+cleared it, and **both went on to delete**. My own comment in the code claimed
+this was safe; the test proved it was not. Replaced with `claim()`, which uses
+Postgres `DELETE … RETURNING` so exactly one caller wins; the loser gets a
+benign outcome.
+
+**Documented, not fixed — same-slot double booking.** Conflict detection reads
+the calendar and then writes with no lock between. Under ordinary interleaving
+the first write lands before the second read, so the clash is caught — and a
+test asserts that. But that test proves nothing about safety; it passes because
+the scheduling happened to serialise. A second test holds the write open so both
+reads complete first, and **both creates succeed**, demonstrating the race
+deterministically rather than hoping a scheduler reveals it.
+
+Exposure is limited but real: Phase 1 dedupes identical messages and a single
+user's jobs usually run one at a time, but `WORKER_CONCURRENCY` is 5 and nothing
+pins a tenant to a worker. The fix is a per-tenant advisory lock
+(`pg_advisory_xact_lock` on a hash of the tenant id) around read-then-write, or a
+uniqueness constraint on the slot. Deferred to Phase 3 and pinned by a test that
+should be *updated* when fixed, not deleted.
+
+## 34. The intent evaluation script
+
+`npm run eval:intent` runs fixtures through the **real** Anthropic API and prints
+what came back.
+
+The automated suite uses a scripted classifier, which is what keeps CI offline
+and deterministic — but it means the model's actual judgement is never
+exercised. Specifically: whether it *asks* instead of guessing on "book
+something for 9" (9am or 9pm?), or resolves "next Tuesday" to the right date.
+Those are the failures that put a wrong entry in someone's real calendar, and no
+mock can catch them.
+
+The script is deliberately outside CI: it costs money, needs a key, and its
+ambiguous cases are judgement calls rather than invariants. Clear fixtures fail
+the run; ambiguous ones (`≈`) report and never fail, because reasonable people
+disagree about them and the output is there to be read. It also flags when the
+keyword pre-filter would have dropped a fixture before the model ever saw it —
+a class of failure the model cannot be blamed for and that is otherwise
+invisible.
+
 ---
 
 ## Still deferred after Phase 2

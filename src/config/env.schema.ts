@@ -55,6 +55,19 @@ export const envSchema = z.object({
     .default('log'),
 
   // --- Phase 2: calendar agent ---------------------------------------------
+  //
+  // Every credential below is OPTIONAL, and that is deliberate. Making them
+  // required meant a missing Google key crash-looped the gateway, taking the
+  // Telegram webhook down with it — so messages were lost because a *calendar*
+  // credential was absent. Ingestion is Phase 1 functionality and must not be
+  // held hostage to Phase 2 configuration.
+  //
+  // When any of them is missing the calendar agent reports itself unconfigured,
+  // tells the user, and logs loudly; the gateway, queue, and worker keep
+  // running. See `isCalendarConfigured` below.
+  //
+  // Format is still validated when a value IS supplied — an 8-character
+  // encryption key is a mistake worth failing on, an absent one is a choice.
 
   /**
    * 32-byte AES-256-GCM key, hex-encoded (64 hex chars). Encrypts OAuth tokens
@@ -63,24 +76,25 @@ export const envSchema = z.object({
    */
   TOKEN_ENCRYPTION_KEY: z
     .string()
-    .regex(/^[0-9a-fA-F]{64}$/, 'must be 64 hex characters (32 bytes)'),
+    .regex(/^[0-9a-fA-F]{64}$/, 'must be 64 hex characters (32 bytes)')
+    .optional(),
 
-  GOOGLE_CLIENT_ID: z.string().min(1),
-  GOOGLE_CLIENT_SECRET: z.string().min(1),
+  GOOGLE_CLIENT_ID: z.string().min(1).optional(),
+  GOOGLE_CLIENT_SECRET: z.string().min(1).optional(),
 
   /**
    * Must match a redirect URI registered in the Google Cloud console exactly,
    * including scheme, port, and path.
    */
-  GOOGLE_REDIRECT_URI: z.string().url(),
+  GOOGLE_REDIRECT_URI: z.string().url().optional(),
 
   /** Signs the OAuth `state` parameter so callbacks cannot be forged. */
-  OAUTH_STATE_SECRET: z.string().min(16),
+  OAUTH_STATE_SECRET: z.string().min(16).optional(),
 
   /** How long a generated OAuth link stays valid, in seconds. */
   OAUTH_STATE_TTL_SECONDS: z.coerce.number().int().positive().default(900),
 
-  ANTHROPIC_API_KEY: z.string().min(1),
+  ANTHROPIC_API_KEY: z.string().min(1).optional(),
 
   /** Model used for calendar intent classification and extraction. */
   ANTHROPIC_MODEL: z.string().min(1).default('claude-haiku-4-5'),
@@ -93,6 +107,38 @@ export const envSchema = z.object({
 });
 
 export type Env = z.infer<typeof envSchema>;
+
+/**
+ * The credentials the calendar agent cannot operate without.
+ *
+ * All-or-nothing on purpose: a half-configured integration (a Google client but
+ * no encryption key, say) fails deep inside a request with a confusing error.
+ * Reporting it as unconfigured up front is both easier to diagnose and safer.
+ */
+export const CALENDAR_REQUIRED_VARS = [
+  'TOKEN_ENCRYPTION_KEY',
+  'GOOGLE_CLIENT_ID',
+  'GOOGLE_CLIENT_SECRET',
+  'GOOGLE_REDIRECT_URI',
+  'OAUTH_STATE_SECRET',
+  'ANTHROPIC_API_KEY',
+] as const satisfies readonly (keyof Env)[];
+
+/** Which calendar credentials are absent. Empty means fully configured. */
+export function missingCalendarConfig(
+  env: Pick<Env, (typeof CALENDAR_REQUIRED_VARS)[number]>,
+): string[] {
+  return CALENDAR_REQUIRED_VARS.filter((key) => {
+    const value = env[key];
+    return value === undefined || value === '';
+  });
+}
+
+export function isCalendarConfigured(
+  env: Pick<Env, (typeof CALENDAR_REQUIRED_VARS)[number]>,
+): boolean {
+  return missingCalendarConfig(env).length === 0;
+}
 
 /**
  * Nest's ConfigModule `validate` hook. Throwing here aborts bootstrap.

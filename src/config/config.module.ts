@@ -3,6 +3,7 @@ import {
   ConfigModule as NestConfigModule,
   ConfigService,
 } from '@nestjs/config';
+import { CalendarConfigService } from './calendar-config.service';
 import { Env, validateEnv } from './env.schema';
 
 /**
@@ -24,6 +25,7 @@ export type TypedConfigService = ConfigService<Env, true>;
       envFilePath: ['.env'],
     }),
   ],
-  exports: [NestConfigModule],
+  providers: [CalendarConfigService],
+  exports: [NestConfigModule, CalendarConfigService],
 })
 export class AppConfigModule {}

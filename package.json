@@ -23,7 +23,8 @@
     "test:integration": "./scripts/test-stack.sh integration",
     "test:e2e:only": "./scripts/test-stack.sh e2e",
     "lint:fix": "eslint \"{src,test}/**/*.ts\" --fix",
-    "format:check": "prettier --check \"{src,test}/**/*.ts\""
+    "format:check": "prettier --check \"{src,test}/**/*.ts\"",
+    "eval:intent": "ts-node -P tsconfig.json scripts/eval-intent.ts"
   },
   "dependencies": {
     "@anthropic-ai/sdk": "^0.112.3",
@@ -61,7 +62,8 @@
     "ts-jest": "^29.2.5",
     "ts-loader": "^9.5.1",
     "tsconfig-paths": "^4.2.0",
-    "typescript": "^5.7.3"
+    "typescript": "^5.7.3",
+    "ts-node": "^10.9.2"
   },
   "engines": {
     "node": ">=20"

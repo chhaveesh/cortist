@@ -1,4 +1,5 @@
 import request from 'supertest';
+import { CalendarConfigService } from '../../src/config/calendar-config.service';
 import { PrismaService } from '../../src/prisma/prisma.service';
 import { REDIS_CLIENT } from '../../src/redis/redis.module';
 import {
@@ -34,7 +35,29 @@ describe('GET /health (integration)', () => {
       status: 'ok',
       redis: 'connected',
       postgres: 'connected',
+      // .env.test supplies the full calendar credential set.
+      calendar: 'configured',
     });
+  });
+
+  /**
+   * An unconfigured calendar is a setup state, not an outage. Reporting it is
+   * useful; returning 503 for it would pull a gateway that is happily accepting
+   * and queueing messages out of load-balancer rotation.
+   */
+  it('reports calendar configuration without affecting the status code', async () => {
+    const calendarConfig = harness.app.get(CalendarConfigService);
+    jest.spyOn(calendarConfig, 'isConfigured', 'get').mockReturnValue(false);
+    jest
+      .spyOn(calendarConfig, 'missingVars', 'get')
+      .mockReturnValue(['ANTHROPIC_API_KEY']);
+
+    const response = await get();
+
+    expect(response.status).toBe(200);
+    expect(response.body.status).toBe('ok');
+    expect(response.body.calendar).toBe('not_configured');
+    expect(response.body.calendarMissing).toEqual(['ANTHROPIC_API_KEY']);
   });
 
   it('actually probes the dependencies rather than returning a static 200', async () => {

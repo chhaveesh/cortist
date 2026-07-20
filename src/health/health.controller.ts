@@ -1,6 +1,7 @@
 import { Controller, Get, HttpStatus, Inject, Res } from '@nestjs/common';
 import type { Response } from 'express';
 import Redis from 'ioredis';
+import { CalendarConfigService } from '../config/calendar-config.service';
 import { PrismaService } from '../prisma/prisma.service';
 import { REDIS_CLIENT } from '../redis/redis.module';
 
@@ -10,6 +11,15 @@ export interface HealthResponse {
   status: 'ok' | 'error';
   redis: DependencyStatus;
   postgres: DependencyStatus;
+  /**
+   * Whether the calendar agent has the credentials it needs. Reported but
+   * deliberately NOT part of the 200/503 decision: an unconfigured calendar is
+   * a setup state, not an outage, and a 503 would pull a gateway that is
+   * happily accepting and queueing messages out of load-balancer rotation.
+   */
+  calendar: 'configured' | 'not_configured';
+  /** Names of the absent calendar variables. Present only when unconfigured. */
+  calendarMissing?: string[];
   /** Present only when degraded: which dependencies failed, and why. */
   failures?: Array<{ dependency: string; error: string }>;
 }
@@ -26,6 +36,7 @@ export class HealthController {
   constructor(
     private readonly prisma: PrismaService,
     @Inject(REDIS_CLIENT) private readonly redis: Redis,
+    private readonly calendarConfig: CalendarConfigService,
   ) {}
 
   @Get()
@@ -44,10 +55,16 @@ export class HealthController {
 
     const healthy = failures.length === 0;
 
+    const calendarConfigured = this.calendarConfig.isConfigured;
+
     const body: HealthResponse = {
       status: healthy ? 'ok' : 'error',
       redis: redis.error ? 'disconnected' : 'connected',
       postgres: postgres.error ? 'disconnected' : 'connected',
+      calendar: calendarConfigured ? 'configured' : 'not_configured',
+      ...(calendarConfigured
+        ? {}
+        : { calendarMissing: this.calendarConfig.missingVars }),
       ...(healthy ? {} : { failures }),
     };
 

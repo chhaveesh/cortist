@@ -31,12 +31,27 @@ export class InvalidOAuthStateError extends Error {
 @Injectable()
 export class OAuthStateService {
   private readonly logger = new Logger(OAuthStateService.name);
-  private readonly secret: string;
+  /** Undefined when OAUTH_STATE_SECRET is unset — see `requireSecret`. */
+  private readonly secret: string | undefined;
   private readonly ttlSeconds: number;
 
   constructor(config: ConfigService<Env, true>) {
     this.secret = config.get('OAUTH_STATE_SECRET', { infer: true });
     this.ttlSeconds = config.get('OAUTH_STATE_TTL_SECONDS', { infer: true });
+  }
+
+  /**
+   * Signing with an absent secret would produce states anyone could forge, so
+   * this throws rather than degrading. Construction still succeeds, so a
+   * missing calendar credential cannot crash the gateway at DI time.
+   */
+  private requireSecret(): string {
+    if (!this.secret) {
+      throw new Error(
+        'OAUTH_STATE_SECRET is not set — cannot sign or verify OAuth state',
+      );
+    }
+    return this.secret;
   }
 
   issue(tenantId: string, chatId: string, now = new Date()): string {
@@ -104,7 +119,9 @@ export class OAuthStateService {
   }
 
   private sign(body: string): string {
-    return createHmac('sha256', this.secret).update(body).digest('base64url');
+    return createHmac('sha256', this.requireSecret())
+      .update(body)
+      .digest('base64url');
   }
 
   private signatureMatches(body: string, provided: string): boolean {

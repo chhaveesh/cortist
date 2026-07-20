@@ -1,5 +1,6 @@
 import { Injectable, Logger } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
+import { Prisma } from '@prisma/client';
 import { z } from 'zod';
 import { Env } from '../../../config/env.schema';
 import { PrismaService } from '../../../prisma/prisma.service';
@@ -109,6 +110,53 @@ export class PendingActionService {
         `Pending action for ${tenantId} failed validation: ${parsed.error.message}`,
       );
       await this.clear(tenantId);
+      return null;
+    }
+
+    return parsed.data;
+  }
+
+  /**
+   * Atomically take ownership of the pending action: remove the row and return
+   * what it held, or null if there was nothing (or someone else got there
+   * first).
+   *
+   * This is the method to use before *executing* a confirmed action. `get()`
+   * followed by `clear()` is a check-then-act race — two concurrent "yes"
+   * replies (a double-tap, or a retried job) both read the row before either
+   * cleared it, and both went on to delete. Postgres `DELETE … RETURNING` makes
+   * exactly one caller the winner.
+   */
+  async claim(
+    tenantId: string,
+    now = new Date(),
+  ): Promise<PendingActionPayload | null> {
+    let row;
+    try {
+      row = await this.prisma.pendingAction.delete({
+        where: { userId: tenantId },
+      });
+    } catch (error) {
+      // P2025 = no row matched: nothing pending, or another caller won.
+      if (
+        error instanceof Prisma.PrismaClientKnownRequestError &&
+        error.code === 'P2025'
+      ) {
+        return null;
+      }
+      throw error;
+    }
+
+    if (row.expiresAt.getTime() <= now.getTime()) {
+      this.logger.debug(`Claimed an already-expired action for ${tenantId}`);
+      return null;
+    }
+
+    const parsed = pendingActionPayloadSchema.safeParse(row.payload);
+    if (!parsed.success) {
+      this.logger.error(
+        `Claimed pending action for ${tenantId} failed validation: ${parsed.error.message}`,
+      );
       return null;
     }
 

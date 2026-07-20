@@ -49,7 +49,7 @@ Verify it is alive:
 
 ```bash
 curl localhost:3000/health
-# {"status":"ok","postgres":"up","redis":"up"}
+# {"status":"ok","redis":"connected","postgres":"connected","calendar":"configured"}
 ```
 
 Send a simulated Telegram delivery (no bot token or public URL needed):
@@ -118,9 +118,10 @@ POST the same payload again and the response becomes
 │                                                          │
 │  1. pending confirmation?  → yes/no resolves it FIRST    │
 │  2. keyword pre-filter     → skip without an LLM call    │
-│  3. no calendar connected? → reply with an OAuth link    │
-│  4. classify intent (Claude Haiku 4.5, structured output)│
-│  5. create      → conflict-check, then execute           │
+│  3. credentials present?   → else "not configured" reply │
+│  4. no calendar connected? → reply with an OAuth link    │
+│  5. classify intent (Claude Haiku 4.5, structured output)│
+│  6. create      → conflict-check, then execute           │
 │     reschedule  → resolve event, conflict-check, ASK     │
 │     delete      → resolve event, ASK                     │
 └───────────────┬──────────────────────────────────────────┘
@@ -201,6 +202,23 @@ npm run test:integration # integration tier (starts/stops its own containers)
 npm run test:e2e:only    # end-to-end tier only
 ```
 
+### Checking what the model actually does
+
+The suite uses a scripted classifier, so the *model's* judgement is never
+exercised by CI. That matters for one thing in particular: whether it asks
+instead of guessing. `"book something for 9"` — 9am or 9pm? Guessing puts a real
+event in someone's calendar at the wrong time, and no mock can catch it.
+
+```bash
+npm run eval:intent              # every fixture, against the real API
+npm run eval:intent -- ambiguous # just the ambiguous ones
+```
+
+Needs `ANTHROPIC_API_KEY` and costs a few cents. Clear fixtures fail the run;
+ambiguous ones print `≈` and never fail — they're there to be read, not passed.
+It also flags when the keyword pre-filter would have dropped a phrasing before
+the model ever saw it. Add your own phrasings to `scripts/eval-intent.ts`.
+
 That one command starts isolated Postgres and Redis containers, applies
 migrations, runs every suite, and tears the containers down again. It needs no
 Telegram bot token, no public URL, and no ngrok tunnel — Telegram is simulated
@@ -236,6 +254,9 @@ KEEP_TEST_STACK=1 npm run test:e2e   # leave containers up to iterate on a failu
 | Integration | `test/integration/calendar-confirmation.integration-spec.ts` | prompt sent + **nothing executed**; yes / no / unclear / expired |
 | Integration | `test/integration/calendar-connection.integration-spec.ts` | OAuth link when unconnected; reconnect prompt on revocation |
 | Integration | `test/integration/calendar-ambiguity.integration-spec.ts` | 0 matches, 2+ matches, event vanishing mid-confirmation |
+| Integration | `test/integration/calendar-concurrency.integration-spec.ts` | concurrent requests; one pending action; **a pinned double-booking race** |
+| Unit | `test/unit/calendar-config.spec.ts` | boots with credentials absent; format still validated when present |
+| End-to-end | `test/e2e/calendar-chain.e2e-spec.ts` | webhook → queue → worker → agent → reply, **routed to the right chat** |
 | End-to-end | `test/e2e/pipe.e2e-spec.ts` | gateway → queue → **real worker** → Postgres |
 | End-to-end | `test/e2e/shutdown.e2e-spec.ts` | SIGTERM drain, no stranded jobs, clean handover |
 | End-to-end | `test/e2e/retry.e2e-spec.ts` | 3 attempts, exponential backoff, failed set |
@@ -296,6 +317,27 @@ reply.
 A pending confirmation expires after `PENDING_ACTION_TTL_SECONDS` (5 min
 default). Replying with a *new* calendar request instead of yes/no supersedes
 the old one — your "yes" always refers to the most recent question.
+
+### Running without calendar credentials
+
+The Phase 2 credentials are **optional**. With any of them absent the gateway,
+queue, and worker start and run normally — Telegram messages are still accepted
+and queued — and only the calendar path degrades:
+
+```bash
+curl localhost:3000/health
+# {"status":"ok", ..., "calendar":"not_configured",
+#  "calendarMissing":["GOOGLE_CLIENT_ID","ANTHROPIC_API_KEY"]}
+```
+
+A calendar request gets an honest "this isn't configured on my side" reply;
+non-calendar messages are unaffected. The boot log names every missing variable.
+
+This is deliberate: requiring them once crash-looped the gateway, taking the
+webhook down and losing user messages over a credential the ingestion path never
+touches. `/health` still returns **200** in this state — an unconfigured
+calendar is a setup state, not an outage, and a 503 would pull a working gateway
+out of load-balancer rotation.
 
 ### Connecting a calendar
 

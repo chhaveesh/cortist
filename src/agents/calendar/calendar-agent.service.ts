@@ -1,4 +1,5 @@
 import { Injectable, Logger } from '@nestjs/common';
+import { CalendarConfigService } from '../../config/calendar-config.service';
 import { TelegramMessageJob } from '../../common/contracts/telegram-message.job';
 import {
   MissingOAuthConnectionError,
@@ -27,6 +28,7 @@ import {
  * so the worker and the tests can both assert on the outcome.
  */
 export type CalendarAgentOutcome =
+  | { status: 'not_configured'; missing: string[] }
   | { status: 'skipped'; reason: 'not_calendar_related' | 'prefiltered' }
   | { status: 'needs_connection' }
   | { status: 'clarification_requested' }
@@ -64,6 +66,7 @@ export class CalendarAgentService {
   private readonly logger = new Logger(CalendarAgentService.name);
 
   constructor(
+    private readonly calendarConfig: CalendarConfigService,
     private readonly classifier: CalendarIntentClassifier,
     private readonly calendar: CalendarClient,
     private readonly conflicts: ConflictDetectorService,
@@ -110,7 +113,26 @@ export class CalendarAgentService {
       return { status: 'skipped', reason: 'prefiltered' };
     }
 
-    // 3. No connection means we cannot act — send the OAuth link instead.
+    // 3. Credentials present? Checked after the pre-filter so an unconfigured
+    // deployment stays silent on non-calendar chatter, and before anything
+    // touches Google or Anthropic.
+    if (!this.calendarConfig.isConfigured) {
+      const missing = this.calendarConfig.missingVars;
+      this.logger.error(
+        `Cannot handle a calendar request for tenant ${job.tenantId} — missing config: ${missing.join(', ')}`,
+      );
+      await this.telegram
+        .sendMessage(
+          job.chatId,
+          "I can't reach your calendar — my calendar integration isn't " +
+            'configured yet. This is a setup problem on my side, not something ' +
+            'you did.',
+        )
+        .catch(() => undefined);
+      return { status: 'not_configured', missing };
+    }
+
+    // 4. No connection means we cannot act — send the OAuth link instead.
     if (!(await this.tokens.hasConnection(job.tenantId))) {
       await this.sendConnectPrompt(job);
       return { status: 'needs_connection' };
@@ -444,18 +466,28 @@ export class CalendarAgentService {
    */
   private async handleConfirmationReply(
     job: TelegramMessageJob,
-    pendingAction: PendingActionPayload,
+    pending: PendingActionPayload,
     reply: 'affirmative' | 'negative',
   ): Promise<CalendarAgentOutcome> {
+    let pendingAction = pending;
     if (reply === 'negative') {
       await this.pending.clear(job.tenantId);
       await this.telegram.sendMessage(job.chatId, 'OK — nothing changed.');
       return { status: 'declined' };
     }
 
-    // Clear before executing: if the API call fails, the user gets an error
-    // rather than a stale confirmation that could fire twice.
-    await this.pending.clear(job.tenantId);
+    // Claim atomically rather than clearing: `get()` then `clear()` is a
+    // check-then-act race, and two concurrent "yes" replies both passed it and
+    // both executed the delete. `claim()` uses DELETE … RETURNING, so exactly
+    // one caller wins. Losing the race means someone else already handled it.
+    const claimed = await this.pending.claim(job.tenantId);
+    if (!claimed) {
+      this.logger.debug(
+        `Confirmation for ${job.tenantId} lost the claim — already handled`,
+      );
+      return { status: 'declined' };
+    }
+    pendingAction = claimed;
 
     let accessToken: string;
     try {

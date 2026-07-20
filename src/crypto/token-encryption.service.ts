@@ -27,26 +27,56 @@ export class TokenEncryptionService {
   private static readonly IV_BYTES = 12; // 96 bits — the GCM-recommended size
   private static readonly AUTH_TAG_BYTES = 16;
 
-  private readonly key: Buffer;
+  /**
+   * Null when TOKEN_ENCRYPTION_KEY is unset. Absence is tolerated at
+   * construction and enforced at use: throwing here would crash the whole
+   * process at DI time, taking Telegram ingestion down over a calendar
+   * credential. Nothing can be encrypted or decrypted without it either way —
+   * the difference is only whether the failure is contained.
+   */
+  private readonly key: Buffer | null;
 
   constructor(config: ConfigService<Env, true>) {
-    const hexKey: string = config.get('TOKEN_ENCRYPTION_KEY', { infer: true });
-    this.key = Buffer.from(hexKey, 'hex');
+    const hexKey: string | undefined = config.get('TOKEN_ENCRYPTION_KEY', {
+      infer: true,
+    });
 
-    // The env schema already enforces this; assert anyway, because a short key
-    // here would silently weaken every token in the database.
-    if (this.key.length !== 32) {
+    if (!hexKey) {
+      this.key = null;
+      return;
+    }
+
+    const key = Buffer.from(hexKey, 'hex');
+
+    // The env schema already enforces the length; assert anyway, because a
+    // short key would silently weaken every token in the database.
+    if (key.length !== 32) {
       throw new Error(
-        `TOKEN_ENCRYPTION_KEY must decode to 32 bytes, got ${this.key.length}`,
+        `TOKEN_ENCRYPTION_KEY must decode to 32 bytes, got ${key.length}`,
       );
     }
+
+    this.key = key;
+  }
+
+  get isConfigured(): boolean {
+    return this.key !== null;
+  }
+
+  private requireKey(): Buffer {
+    if (!this.key) {
+      throw new Error(
+        'TOKEN_ENCRYPTION_KEY is not set — cannot encrypt or decrypt OAuth tokens',
+      );
+    }
+    return this.key;
   }
 
   encrypt(plaintext: string): string {
     const iv = randomBytes(TokenEncryptionService.IV_BYTES);
     const cipher = createCipheriv(
       TokenEncryptionService.ALGORITHM,
-      this.key,
+      this.requireKey(),
       iv,
     );
 
@@ -93,7 +123,7 @@ export class TokenEncryptionService {
 
     const decipher = createDecipheriv(
       TokenEncryptionService.ALGORITHM,
-      this.key,
+      this.requireKey(),
       iv,
     );
     decipher.setAuthTag(authTag);

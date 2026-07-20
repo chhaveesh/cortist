@@ -1,3 +1,4 @@
+import { CalendarConfigService } from '../../src/config/calendar-config.service';
 import {
   CalendarHarness,
   buildJob,
@@ -75,6 +76,56 @@ describe('Calendar connection prompts (integration)', () => {
     expect(outcome).toEqual({ status: 'needs_connection' });
     expect(harness.telegram.last?.text).toContain('/auth/google?state=');
     expect(harness.calendar.calls).toEqual([]);
+  });
+
+  /**
+   * Degraded mode. Requiring these credentials once crash-looped the gateway,
+   * taking the Telegram webhook down and losing messages over a calendar key
+   * the ingestion path never touches.
+   */
+  describe('when the calendar integration is not configured', () => {
+    let calendarConfig: CalendarConfigService;
+
+    beforeEach(() => {
+      calendarConfig = harness.app.get(CalendarConfigService);
+      jest.spyOn(calendarConfig, 'isConfigured', 'get').mockReturnValue(false);
+      jest
+        .spyOn(calendarConfig, 'missingVars', 'get')
+        .mockReturnValue(['GOOGLE_CLIENT_ID', 'ANTHROPIC_API_KEY']);
+    });
+
+    afterEach(() => {
+      jest.restoreAllMocks();
+    });
+
+    it('tells the user plainly and touches nothing external', async () => {
+      const outcome = await harness.agent.handle(
+        buildJob(tenantId, 'book a dentist appointment tomorrow at 9'),
+      );
+
+      expect(outcome).toEqual({
+        status: 'not_configured',
+        missing: ['GOOGLE_CLIENT_ID', 'ANTHROPIC_API_KEY'],
+      });
+
+      // No classification, no calendar call, no OAuth link that cannot work.
+      expect(harness.classifier.callCount).toBe(0);
+      expect(harness.calendar.calls).toEqual([]);
+
+      // The user hears something honest rather than silence.
+      const message = harness.telegram.last?.text ?? '';
+      expect(message).toContain("isn't");
+      expect(message).not.toContain('/auth/google');
+    });
+
+    it('stays silent on non-calendar messages', async () => {
+      const outcome = await harness.agent.handle(
+        buildJob(tenantId, 'write me a python script'),
+      );
+
+      expect(outcome).toEqual({ status: 'skipped', reason: 'prefiltered' });
+      expect(harness.telegram.sent).toEqual([]);
+    });
   });
 
   it('proceeds normally once a calendar is connected', async () => {

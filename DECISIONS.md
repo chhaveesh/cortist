@@ -840,6 +840,55 @@ Sharing would mean one service that knows about every agent — which *is* the
 router, built in the wrong place and coupling two agents that are meant to be
 independent.
 
+## 43. Serial test execution belongs in the config, not the command line
+
+`--runInBand` was passed by `scripts/test-stack.sh` but absent from the Jest
+configs. All three harnesses reset state with a global `user.deleteMany()`, so
+two workers sharing one database wipe each other's fixtures mid-test.
+
+Measured rather than assumed: running the integration tier in parallel fails
+**65 of 106 tests**. The suite's correctness depended entirely on the caller
+remembering a flag — a CI that invoked Jest directly would have got a wall of
+failures that look like real bugs in application code.
+
+`maxWorkers: 1` now lives in `jest.integration.config.js` and
+`jest.e2e.config.js`, so the guarantee is a property of the configuration rather
+than of the invocation.
+
+The alternative — per-worker database schemas, or scoping each reset to the
+tenants a suite created — would allow real parallelism and is worth doing if the
+suite ever gets slow enough to care. It currently runs in a few seconds, so the
+complexity is not yet justified.
+
+Fixture tenant IDs were checked at the same time and do not collide: RAG uses
+the 700_000_xxx range, the calendar suites 900_xxx, Phase 1 the 777_xxx range.
+That separation is convention, though — the global reset is what actually made
+parallelism unsafe.
+
+## 44. Threshold validated against the real model
+
+The similarity floor (0.3) could not be validated by the mocked suite: the fake
+embedder controls similarity precisely so that retrieval logic is testable, which
+by construction says nothing about what scores the real model produces.
+
+Checked directly, with the real all-MiniLM-L6-v2 embedding the real fixture PDF
+into real pgvector:
+
+| Question | Best similarity | Behaviour |
+| --- | --- | --- |
+| "What was the revenue in Q4?" | 0.743 | answers |
+| "How many people are on the engineering team?" | 0.628 | answers |
+| "How do I repair a bicycle chain?" | 0.069 | says nothing found |
+| "What is the best recipe for sourdough bread?" | 0.028 | says nothing found |
+| "Who won the football match last night?" | 0.098 | says nothing found |
+
+Relevant and irrelevant questions separate by roughly 6x, with 0.3 sitting well
+inside the gap. That is a comfortable margin rather than a knife edge, which is
+what makes the honesty gate trustworthy in practice and not just in the tests.
+
+Retrieval also selected the semantically correct chunk — the headcount question
+matched the sentence about the engineering team, not the revenue sentence.
+
 ---
 
 ## Still deferred after Phase 3

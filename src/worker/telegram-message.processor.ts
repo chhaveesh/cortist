@@ -2,8 +2,10 @@ import { Injectable, Logger } from '@nestjs/common';
 import { Job } from 'bullmq';
 import { Prisma } from '@prisma/client';
 import { CalendarAgentService } from '../agents/calendar/calendar-agent.service';
+import { RagAgentService } from '../agents/rag/rag-agent.service';
 import {
   TelegramMessageJob,
+  attachmentOf,
   telegramMessageJobSchema,
 } from '../common/contracts/telegram-message.job';
 import { PrismaService } from '../prisma/prisma.service';
@@ -23,7 +25,44 @@ export class TelegramMessageProcessor {
   constructor(
     private readonly prisma: PrismaService,
     private readonly calendarAgent: CalendarAgentService,
+    private readonly ragAgent: RagAgentService,
   ) {}
+
+  /**
+   * Offers the message to each agent in turn until one claims it.
+   *
+   * This is NOT the intent router — it is the honest interim stand-in for one.
+   * Each agent classifies independently and returns `skipped` when the message
+   * is not its business, so ordering only decides who gets first refusal.
+   *
+   * An attachment goes straight to RAG: the calendar agent has nothing to do
+   * with a PDF, and its pre-filter would spend a classification deciding that.
+   *
+   * The real router replaces this with a single up-front classification, which
+   * is what stops the cost growing linearly with the number of agents.
+   */
+  private async dispatch(payload: TelegramMessageJob): Promise<void> {
+    if (attachmentOf(payload)) {
+      const outcome = await this.ragAgent.handle(payload);
+      this.logger.log(
+        `RAG agent handled attachment for message ${payload.messageId}: ${outcome.status}`,
+      );
+      return;
+    }
+
+    const calendar = await this.calendarAgent.handle(payload);
+    if (calendar.status !== 'skipped') {
+      this.logger.log(
+        `Calendar agent handled message ${payload.messageId}: ${calendar.status}`,
+      );
+      return;
+    }
+
+    const rag = await this.ragAgent.handle(payload);
+    this.logger.log(
+      `RAG agent outcome for message ${payload.messageId}: ${rag.status}`,
+    );
+  }
 
   async process(job: Job): Promise<void> {
     // Re-validate at the consumer boundary. The producer is trusted today, but
@@ -55,16 +94,12 @@ export class TelegramMessageProcessor {
     // Agent first, marker second — the ordering matters.
     //
     // Marker-first would let the P2002 branch below short-circuit a retry and
-    // skip the agent entirely, silently dropping the message. Agent-first is
+    // skip the agents entirely, silently dropping the message. Agent-first is
     // safe because CalendarAgentService rethrows only on `rate_limited`, and a
     // rate-limited call never executed — so a retry cannot duplicate an event.
-    // Every other calendar failure returns an outcome instead of throwing, so
-    // it never triggers a BullMQ retry in the first place.
-    const outcome = await this.calendarAgent.handle(payload);
-
-    this.logger.log(
-      `Calendar agent outcome for message ${payload.messageId}: ${outcome.status}`,
-    );
+    // Every other agent failure returns an outcome instead of throwing, so it
+    // never triggers a BullMQ retry in the first place.
+    await this.dispatch(payload);
 
     try {
       await this.prisma.processedMessage.create({

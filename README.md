@@ -7,8 +7,11 @@ A Telegram-based AI personal assistant.
 - **Phase 2** — the first sub-agent: a Google Calendar agent the worker
   dispatches queued messages to, covering create / reschedule / delete with
   conflict detection and confirmation before anything destructive.
+- **Phase 3** — a second, independent sub-agent: a RAG "second brain" that
+  ingests PDFs, pasted text, and web pages, and answers questions about them
+  with citations.
 
-RAG, task, and email agents arrive in later phases and plug into the same queue
+Task and email agents arrive in later phases and plug into the same queue
 contract described below.
 
 ---
@@ -114,6 +117,10 @@ POST the same payload again and the response becomes
 └───────────────┬──────────────────────┘
                 ▼
 ┌──────────────────────────────────────────────────────────┐
+│  AGENTS — each classifies independently (no router yet)  │
+│                                                          │
+│  attachment? → RAG. Otherwise calendar first, then RAG.  │
+├──────────────────────────────────────────────────────────┤
 │  CALENDAR AGENT  (src/agents/calendar/)                  │
 │                                                          │
 │  1. pending confirmation?  → yes/no resolves it FIRST    │
@@ -124,10 +131,20 @@ POST the same payload again and the response becomes
 │  6. create      → conflict-check, then execute           │
 │     reschedule  → resolve event, conflict-check, ASK     │
 │     delete      → resolve event, ASK                     │
+├──────────────────────────────────────────────────────────┤
+│  RAG AGENT  (src/agents/rag/)                            │
+│                                                          │
+│  store → extract → chunk → embed (local) → pgvector      │
+│  query → embed → tenant-scoped search → floor → cite     │
 └───────────────┬──────────────────────────────────────────┘
                 ▼
-        Google Calendar API (calendar.events scope only)
+   Google Calendar API (calendar.events)  +  pgvector (local)
 ```
+
+**There is still no intent router.** Each agent classifies independently and
+returns `skipped` when a message is not its business, so the worker offers the
+message to each in turn. That is honest but O(agents) in cost, which is exactly
+why the router is the next phase.
 
 **Why the pending-confirmation check runs first.** A user replying "yes"
 sends an ordinary Telegram message. Classified normally it comes back
@@ -256,6 +273,11 @@ KEEP_TEST_STACK=1 npm run test:e2e   # leave containers up to iterate on a failu
 | Integration | `test/integration/calendar-ambiguity.integration-spec.ts` | 0 matches, 2+ matches, event vanishing mid-confirmation |
 | Integration | `test/integration/calendar-concurrency.integration-spec.ts` | concurrent requests; one pending action; **a pinned double-booking race** |
 | Unit | `test/unit/calendar-config.spec.ts` | boots with credentials absent; format still validated when present |
+| Unit | `test/unit/chunker.spec.ts` | chunk sizes, overlap, no lost words, degenerate inputs |
+| Unit | `test/unit/extractors.spec.ts` | real PDF fixture; HTML fixture with **boilerplate stripped** |
+| Integration | `test/integration/rag-tenant-isolation.integration-spec.ts` | **the one that matters** — adversarial cross-tenant checks |
+| Integration | `test/integration/rag-ingestion.integration-spec.ts` | PDF / text / URL ingestion, rejections, chunk rows |
+| Integration | `test/integration/rag-retrieval.integration-spec.ts` | citations, similarity floor, model declining |
 | End-to-end | `test/e2e/calendar-chain.e2e-spec.ts` | webhook → queue → worker → agent → reply, **routed to the right chat** |
 | End-to-end | `test/e2e/pipe.e2e-spec.ts` | gateway → queue → **real worker** → Postgres |
 | End-to-end | `test/e2e/shutdown.e2e-spec.ts` | SIGTERM drain, no stranded jobs, clean handover |
@@ -272,6 +294,10 @@ overrides exactly four providers:
 | `CalendarIntentClassifier` | `ScriptedIntentClassifier` — returns queued intents, records its inputs |
 | `GoogleOAuthClient` | `FakeGoogleOAuthClient` — canned token exchange and refresh |
 | `TelegramSenderService` | `RecordingTelegramSender` — captures what the user was told |
+| `EmbeddingClient` | `FakeEmbeddingClient` — **controllable** similarity, not a model's semantics |
+| `RagLlm` | `FakeRagLlm` — scripted intents, summaries, and answers |
+| `UrlFetcher` | `FakeUrlFetcher` — serves saved HTML |
+| `TelegramFileDownloader` | `FakeTelegramFileDownloader` — serves file bytes |
 
 Those are the code's only routes to the outside world, so reaching the network
 would require deliberately binding the real implementations back. No API key,
@@ -294,6 +320,91 @@ composition root `dist/worker.js` uses in production — so it exercises the rea
 process boundary rather than a stand-in.
 
 ---
+
+## The second brain (RAG agent)
+
+### What it does
+
+| You say | It does |
+| --- | --- |
+| *uploads a PDF* | Extracts the text, chunks it, embeds it, replies with a summary and tags |
+| "save this: the API limit is 1000/min" | Stores the text the same way |
+| "save this https://example.com/post" | Fetches the page, strips it to readable text, stores it |
+| "what did that report say about Q4?" | Answers from your documents, **citing the source** |
+| "what is the capital of France?" | Nothing — that isn't a question about your notes |
+
+**It would rather say nothing than guess.** Two gates stand between a question
+and an answer: a similarity floor before the model is called at all, and the
+model's own ability to decline. Vector search always returns its nearest
+neighbours — even when the nearest thing is unrelated — so without the floor an
+almost-empty knowledge base hands the model irrelevant context that reads as
+authoritative. For a second brain, a confident wrong answer is worse than none.
+
+### Embeddings run locally
+
+Anthropic has no embeddings API, so this phase needed a provider regardless.
+Cortist uses **all-MiniLM-L6-v2 via transformers.js**, on this machine:
+
+- No API key, no per-token cost, no rate limit.
+- **No document content leaves your infrastructure** — which matters more here
+  than anywhere else in the system, since this is where your documents live.
+- 384 dimensions, L2-normalized.
+
+The tradeoff is real: retrieval quality is below a current hosted model. The
+model (~97MB) is baked into the Docker image at build time, so the container
+needs no egress at inference and loads it in well under a second.
+
+Classification, summarisation, and grounded answering still use Claude Haiku 4.5.
+
+### Storage
+
+pgvector, in the existing Postgres — no separate vector database. The compose
+files use `pgvector/pgvector:pg16`, because the stock `postgres:16-alpine`
+image does **not** ship the extension.
+
+**Every vector query filters by `user_id`.** That is the tenant isolation
+boundary, and it is a correctness requirement rather than a style rule: vector
+search has no notion of ownership, so without it one person's second brain
+answers questions from another's documents. All raw vector SQL is confined to
+`VectorStoreService` so the boundary is auditable by reading one file, and
+`rag-tenant-isolation.integration-spec.ts` verifies it adversarially — both
+tenants store near-identical text, so a missing filter produces confident
+cross-tenant answers rather than obvious nonsense.
+
+Index: **HNSW**, not IVFFlat. IVFFlat has to be built against populated data, and
+this table starts empty. See DECISIONS.md §37 for the filtered-search caveat.
+
+### Manual verification with a real document
+
+**Not automated** — the suite fakes embeddings so similarity is predictable
+rather than dependent on a model's semantics. This is the one-time check that
+the mocked behaviour reflects reality.
+
+Needs a real bot token (see the calendar walkthrough) and `ANTHROPIC_API_KEY`.
+
+1. `docker compose up -d --wait`, then register the webhook as in the calendar
+   section.
+2. **Upload a real PDF** to your bot — something with content you can verify,
+   like a bank statement or a paper. Expect a reply naming the file, a summary,
+   and 2–3 tags within a few seconds.
+3. **Check it stored:**
+   ```bash
+   docker compose exec postgres psql -U cortist -d cortist \
+     -c 'SELECT source_name, tags, left(summary,60) FROM documents;' \
+     -c 'SELECT count(*) FROM document_chunks;'
+   ```
+4. **Ask a question you know the answer to** — "what did that report say about
+   X?". Confirm the answer is correct *and* cites the right filename.
+5. **Ask something the document does not cover** — "what does it say about
+   penguins?". It must say it found nothing. If it invents an answer, the
+   similarity threshold is too low for this embedding model.
+6. **Save a URL** — "save this https://en.wikipedia.org/wiki/Vector_database" —
+   then ask about it. Check the stored text is the article, not the nav and
+   footer:
+   ```bash
+   docker compose exec postgres psql -U cortist -d cortist \
+     -c "SELECT left(content,200) FROM document_chunks ORDER BY created_at DESC LIMIT 1;"
+   ```
 
 ## The calendar agent
 
@@ -538,6 +649,12 @@ src/
   crypto/                    AES-256-GCM token encryption
   oauth/                     signed state, Google client, token store + refresh
   auth/                      GET /auth/google, /auth/google/callback  [gateway]
+  agents/rag/                ← the second brain, self-contained
+    rag-agent.service.ts       orchestrator; single entry point `handle(job)`
+    embedding/                 EmbeddingClient port + local transformers.js impl
+    ingestion/                 chunker, extractors (pdf/html), URL fetcher
+    retrieval/                 vector store (ALL raw vector SQL) + retrieval
+    intent/                    own classifier — deliberately not shared
   agents/calendar/           ← the calendar agent, self-contained
     calendar-agent.service.ts  orchestrator; single entry point `handle(job)`
     intent/                    wire schema, Anthropic classifier, keyword filter

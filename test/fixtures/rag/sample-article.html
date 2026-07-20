@@ -1,0 +1,78 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <title>Understanding Vector Databases</title>
+    <meta name="description" content="A primer on vector search." />
+  </head>
+  <body>
+    <!--
+      Deliberately padded with the boilerplate a real page carries — nav,
+      cookie banner, sidebar, footer, inline script. The extractor is supposed
+      to drop all of it and keep only the article, so the fixture is only
+      meaningful if the noise is actually present.
+    -->
+    <header id="site-header">
+      <nav>
+        <a href="/">Home</a>
+        <a href="/about">About</a>
+        <a href="/pricing">Pricing</a>
+        <a href="/contact">Contact Us Today</a>
+      </nav>
+    </header>
+
+    <div class="cookie-banner">
+      We use cookies to improve your experience. Accept all cookies? Manage
+      preferences. Reject non-essential cookies.
+    </div>
+
+    <aside class="sidebar">
+      <h3>Related posts</h3>
+      <ul>
+        <li><a href="/a">Ten things about databases</a></li>
+        <li><a href="/b">Why we migrated to Postgres</a></li>
+        <li><a href="/c">Subscribe to our newsletter</a></li>
+      </ul>
+    </aside>
+
+    <article>
+      <h1>Understanding Vector Databases</h1>
+      <p>
+        A vector database stores high-dimensional numerical representations of
+        content, called embeddings, and retrieves them by similarity rather than
+        by exact match. This makes it possible to search by meaning instead of
+        by keyword, which is the foundation of retrieval-augmented generation.
+      </p>
+      <p>
+        Embeddings are produced by a model that maps text into a fixed-length
+        vector, such that semantically related passages end up close together in
+        that space. Distance between two vectors therefore approximates how
+        related the underlying passages are. Cosine distance is the most common
+        measure because it ignores magnitude and compares direction alone.
+      </p>
+      <p>
+        Approximate nearest neighbour indexes such as HNSW trade a small amount
+        of recall for a very large speedup. HNSW builds a navigable small-world
+        graph over the vectors, which can be constructed incrementally as rows
+        arrive. IVFFlat instead partitions the space into clusters and must be
+        built against data that already exists, which makes it a poor fit for a
+        table that starts empty.
+      </p>
+      <p>
+        A common mistake is to omit a tenant filter from the similarity query.
+        In a multi-tenant system this silently returns other people's data,
+        because vector search has no notion of ownership on its own.
+      </p>
+    </article>
+
+    <footer>
+      <p>&copy; 2026 Example Corp. All rights reserved. Privacy policy. Terms
+      of service. Careers. Press enquiries.</p>
+    </footer>
+
+    <script>
+      window.analytics = window.analytics || [];
+      window.analytics.push({ event: 'pageview', path: location.pathname });
+    </script>
+  </body>
+</html>

@@ -5,12 +5,14 @@
 // worker writes to so the end-to-end pipe is observable from tests.
 
 generator client {
-  provider = "prisma-client-js"
+  provider        = "prisma-client-js"
+  previewFeatures = ["postgresqlExtensions"]
 }
 
 datasource db {
-  provider = "postgresql"
-  url      = env("DATABASE_URL")
+  provider   = "postgresql"
+  url        = env("DATABASE_URL")
+  extensions = [vector]
 }
 
 /// One row per onboarded Telegram user. `id` is the internal tenant identifier
@@ -23,8 +25,55 @@ model User {
 
   oauthTokens    OAuthToken[]
   pendingAction  PendingAction?
+  documents      Document[]
+  documentChunks DocumentChunk[]
 
   @@map("users")
+}
+
+/// A document the user asked Cortist to remember.
+model Document {
+  id         String   @id @default(uuid()) @db.Uuid
+  userId     String   @map("user_id") @db.Uuid
+  /// 'pdf' | 'text' | 'url' — see DocumentSourceType.
+  sourceType String   @map("source_type")
+  /// Filename, URL, or a short label for pasted text.
+  sourceName String   @map("source_name")
+  /// LLM-generated one-paragraph summary of the whole document.
+  summary    String
+  tags       String[]
+  createdAt  DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+
+  user   User            @relation(fields: [userId], references: [id], onDelete: Cascade)
+  chunks DocumentChunk[]
+
+  @@index([userId], map: "documents_user_id_idx")
+  @@map("documents")
+}
+
+/// One embedded slice of a document.
+///
+/// `embedding` is a pgvector column and is NOT represented here — Prisma has no
+/// native vector type, so it is added by migration and queried through raw SQL
+/// in VectorStoreService. Everything else stays in the Prisma model so ordinary
+/// reads and cascades keep working.
+model DocumentChunk {
+  id         String   @id @default(uuid()) @db.Uuid
+  documentId String   @map("document_id") @db.Uuid
+  /// Denormalized from documents so a vector search can filter by tenant
+  /// without a join — the join would defeat the index and, more importantly,
+  /// makes the isolation boundary easy to omit by accident.
+  userId     String   @map("user_id") @db.Uuid
+  content    String
+  chunkIndex Int      @map("chunk_index")
+  createdAt  DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+
+  document Document @relation(fields: [documentId], references: [id], onDelete: Cascade)
+  user     User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([documentId, chunkIndex], map: "document_chunks_document_id_chunk_index_key")
+  @@index([userId], map: "document_chunks_user_id_idx")
+  @@map("document_chunks")
 }
 
 /// One row per user per external provider. Both tokens are encrypted at rest

@@ -12,7 +12,10 @@
 
 services:
   postgres-test:
-    image: postgres:16-alpine
+    # pgvector/pgvector rather than the stock postgres image: the RAG agent's
+    # `CREATE EXTENSION vector` fails on postgres:16-alpine, which does not ship
+    # the extension. Same Postgres 16 underneath.
+    image: pgvector/pgvector:pg16
     environment:
       POSTGRES_USER: cortist_test
       POSTGRES_PASSWORD: cortist_test

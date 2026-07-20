@@ -78,7 +78,9 @@ describe('TelegramService', () => {
 
       expect(payload).toEqual({
         jobType: TELEGRAM_MESSAGE_JOB,
-        version: 1,
+        // v2 since Phase 3 — see the contract file for why documents forced a
+        // new version rather than an optional field on v1.
+        version: 2,
         tenantId: TENANT_ID,
         telegramUserId: '9007199254740993',
         chatId: '-1001234567890',
@@ -88,6 +90,35 @@ describe('TelegramService', () => {
       });
 
       expect(telegramMessageJobSchema.safeParse(payload).success).toBe(true);
+    });
+
+    it('omits the attachment field entirely for a plain text message', () => {
+      const payload = service.buildJobPayload(message, TENANT_ID, new Date());
+      expect('attachment' in payload).toBe(false);
+    });
+
+    it('carries a file reference, never the file bytes', () => {
+      // A 20MB PDF has no business in a Redis job payload; the worker fetches
+      // it from Telegram when it is ready to process it.
+      const withFile: ActionableMessage = {
+        ...message,
+        attachment: {
+          fileId: 'BQACAgIAAxkBAAI',
+          fileName: 'report.pdf',
+          mimeType: 'application/pdf',
+          fileSize: 512_000,
+        },
+      };
+
+      const payload = service.buildJobPayload(withFile, TENANT_ID, new Date());
+
+      expect(payload.attachment).toEqual({
+        fileId: 'BQACAgIAAxkBAAI',
+        fileName: 'report.pdf',
+        mimeType: 'application/pdf',
+        fileSize: 512_000,
+      });
+      expect(JSON.stringify(payload).length).toBeLessThan(1000);
     });
 
     it('encodes 64-bit ids as strings so JSON cannot lose precision', () => {
@@ -119,7 +150,7 @@ describe('TelegramService', () => {
       expect(queue.enqueue).toHaveBeenCalledWith(
         QUEUES.TELEGRAM_MESSAGES,
         TELEGRAM_MESSAGE_JOB,
-        expect.objectContaining({ version: 1, tenantId: TENANT_ID }),
+        expect.objectContaining({ version: 2, tenantId: TENANT_ID }),
         { jobId: 'tg:456:1' },
       );
     });

@@ -671,12 +671,188 @@ invisible.
 
 ---
 
-## Still deferred after Phase 2
+# Phase 3 — RAG second brain
+
+## 35. Local embeddings, because Anthropic has none
+
+The spec said "use whatever LLM provider is already configured from Phase 2".
+That is Anthropic, and **Anthropic does not offer an embeddings API** — their
+docs point to Voyage AI. So this phase needed a new vendor no matter what; it
+was a decision, not a default.
+
+**Chosen: all-MiniLM-L6-v2 via transformers.js, running locally.** 384
+dimensions, L2-normalized (verified by spike before building on it: norm 1.0000,
+8ms per embed).
+
+The deciding argument is where this data lives. A second brain holds whatever
+the user considers worth remembering — bank statements, medical letters,
+contracts. Sending all of it to a third party to be vectorised is a meaningfully
+different privacy posture from sending a calendar request. Locally: no API key,
+no per-token cost, no rate limit, and no document content leaves the machine.
+
+The cost is real and worth stating: retrieval quality is below a current hosted
+model, and the model is ~97MB. It is **baked into the Docker image at build
+time** rather than fetched at runtime — otherwise the first message to reach the
+agent triggers a Hugging Face download, needing egress the container may not
+have and adding ~10s to that user's request. Measured in-container after baking:
+**678ms to load**, versus 10.7s cold.
+
+Classification, summarisation, and answering still use Claude Haiku 4.5, so the
+LLM provider is unchanged.
+
+## 36. Documents forced a genuine contract v2
+
+**Phase 1 was silently dropping every document upload.**
+`extractActionableMessage` required a non-empty `text`, and a Telegram document
+message carries `document` plus an optional `caption` and no `text` at all. The
+webhook answered 200 and discarded the file. A Phase 2 test asserted this as
+correct behaviour, which is how it survived two phases unnoticed.
+
+Fixing it created `TelegramMessageJobV2` alongside v1, rather than adding an
+optional field to v1. Optional fields would have been backward-compatible in
+practice — and that is exactly the reasoning that makes `version` decorative.
+The union is the mechanism that lets jobs enqueued seconds before a deploy keep
+deserializing afterwards; using it the first time it was actually needed is the
+point.
+
+Two details: `text` stays required on v2 and holds the caption (empty string
+when absent), so a v2 consumer reads it exactly as a v1 consumer does. And
+**only the file reference travels on the queue, never the bytes** — a 20MB PDF
+has no business in a Redis payload, so the worker fetches it from Telegram when
+it is ready.
+
+## 37. pgvector: HNSW, and the filtered-search caveat
+
+**HNSW over IVFFlat.** IVFFlat clusters existing rows, so building it on an
+empty table gives poor recall until rebuilt — and this table starts empty and
+grows continuously, the case IVFFlat handles worst. HNSW builds fine on empty
+and needs no `lists` tuning. Cosine ops, since the embeddings are unit vectors.
+
+**The caveat that matters:** an HNSW scan with `WHERE user_id = ?` post-filters.
+It finds K global nearest neighbours and *then* drops other tenants' rows, so it
+can return fewer than K — or none — purely because another tenant's documents
+happened to be closer. For a second brain that is a correctness problem, not a
+performance one. `hnsw.iterative_scan` is enabled to compensate.
+
+Correctness never depends on the index being used: with no index Postgres falls
+back to an exact scan, which is right by construction. At this project's scale
+that is also fast. The index is an optimisation, and the tests assert
+correctness rather than index usage.
+
+## 38. Tenant isolation, verified by mutation
+
+Every vector query filters by `user_id`, and all raw vector SQL is confined to
+`VectorStoreService` so the boundary is auditable by reading one file. `user_id`
+is denormalized onto `document_chunks` so the filter needs no join — a join
+would defeat the index and, more importantly, is easy to omit by accident.
+
+The isolation tests are deliberately adversarial: both tenants store *textually
+near-identical* content, so a missing filter yields confident cross-tenant
+answers rather than obvious nonsense. A test with unrelated content would pass
+with the filter removed.
+
+**Verified by deleting the filter and re-running.** Three tests failed, at three
+different layers: the SQL results, the sources handed to the LLM, and the
+user-visible citation. A passing isolation test that survives its own mutation
+is not evidence of anything.
+
+## 39. Two honesty gates on retrieval
+
+For a second brain, a confident wrong answer is worse than no answer — the whole
+value is being able to trust what it says about your own notes. So:
+
+1. **A similarity floor (0.3) before the LLM is called at all.** Vector search
+   always returns its nearest neighbours, even when the nearest thing is
+   unrelated. Without a floor, an almost-empty knowledge base hands the model
+   irrelevant chunks that read as authoritative context.
+2. **The model's own `answered` flag**, so it can decline even when chunks
+   cleared the floor but do not actually contain the answer.
+
+The threshold is tuned for all-MiniLM-L6-v2, whose scores run lower than larger
+models'. It is the first thing to revisit if the embedding model changes, and is
+called out as such in `.env.example`.
+
+"No documents at all" is reported separately from "nothing matched" — they need
+different replies, and conflating them would tell a new user their question was
+bad when the real answer is that they have not saved anything yet.
+
+## 40. Chunking: characters, not tokens
+
+~2000 characters with 200 of overlap (roughly 500/50 tokens), split recursively
+on paragraph → sentence → word. Real token counting needs either a vendor round
+trip per chunk or a bundled BPE, and at v1 the precision buys nothing.
+
+Overlap exists so a fact straddling a boundary is not unretrievable: without it,
+a sentence split across two chunks appears whole in neither.
+
+**A bug the tests caught.** After emitting a chunk, the overlap tail was
+prepended to the next one unconditionally — so when a piece was already at the
+size limit (the hard-split path, where every piece is exactly `maxChars`), the
+result was `overlap + maxChars` and **exceeded the limit the caller was
+promised**. That is precisely the invariant whose violation the embedding model
+would absorb silently by truncating. Now the overlap is dropped when it would
+not fit.
+
+Extraction also rejoins lines wrapped mid-sentence. PDF and HTML preserve source
+line breaks, so a phrase spanning a wrap contains a newline where a reader
+expects a space — which breaks phrase matching and inserts spurious boundaries
+into the text the model sees.
+
+Chunk size, overlap, and token-vs-character counting are all explicit tuning
+targets once there is retrieval quality to measure.
+
+## 41. unpdf over pdf-parse; Readability over a raw dump
+
+**PDF: `unpdf`**, not the `pdf-parse` the spec suggested. pdf-parse is
+effectively unmaintained and its entry point runs a demo against a bundled test
+file when imported without arguments — a well-known footgun in bundled and
+containerised builds. `unpdf` wraps Mozilla's actively maintained pdf.js.
+
+Scope is text-layer PDFs. A scanned document is images of text and would need
+OCR; it is detected (via a minimum-usable-characters check, since scans often
+yield a few stray ligatures rather than nothing) and reported honestly rather
+than ingested as an empty document.
+
+**HTML: Mozilla Readability**, the algorithm behind Firefox Reader View. Raw
+HTML would fill the store with navigation, cookie banners, and footers —
+boilerplate that is near-identical across every page of a site, and therefore
+the content most likely to match a query for entirely the wrong reasons. The
+fixture test asserts the boilerplate is gone, not merely that the article is
+present.
+
+jsdom is pinned to v26: v29 pulls in an ESM-only dependency that Jest's CJS
+loader cannot require, which broke the whole extractor suite. Jest also runs with
+`--experimental-vm-modules` for unpdf's dynamic import.
+
+## 42. Two agents, still no router
+
+The worker offers each message to the agents in turn until one claims it.
+Attachments go straight to RAG, since the calendar agent has nothing to do with
+a PDF and its pre-filter would spend a classification deciding that.
+
+This is the honest interim stand-in for a router, and its cost is O(agents) —
+each agent classifies independently. That is precisely the argument for building
+the real router next: with three or four agents, every message would pay for
+several classifications to reach one that cares.
+
+The RAG agent has its own classifier rather than sharing the calendar agent's.
+Sharing would mean one service that knows about every agent — which *is* the
+router, built in the wrong place and coupling two agents that are meant to be
+independent.
+
+---
+
+## Still deferred after Phase 3
 
 Recurring-event editing (the client expands instances via `singleEvents`, but
 editing a series is not modelled); attendee invitations and responses; free/busy
 negotiation beyond detect-and-report; multiple calendars per user (everything
 targets `primary`); a general multi-agent router; key rotation with
 re-encryption. The Phase 1 deferrals — rate limiting, a dead-letter queue with
-alerting, structured JSON logging with trace correlation, and non-text message
-handling — all still stand.
+alerting, and structured JSON logging with trace correlation — all still stand.
+
+Phase 3 adds: the intent router (§42); re-embedding when the model changes (the
+vector dimension is fixed by migration, so a model swap needs a new migration
+*and* a backfill); OCR for scanned PDFs; document deletion and listing over
+Telegram; reranking; and tuning chunk size, overlap, and the similarity
+threshold against measured retrieval quality rather than judgement.

@@ -11,6 +11,7 @@ import { Job, Worker } from 'bullmq';
 import { RedisOptions } from 'ioredis';
 import { Env } from '../config/env.schema';
 import { CalendarAgentModule } from '../agents/calendar/calendar-agent.module';
+import { RagAgentModule } from '../agents/rag/rag-agent.module';
 import { JOB_ATTEMPTS, QUEUES } from '../queue/queue.constants';
 import { REDIS_OPTIONS } from '../redis/redis.module';
 import { TelegramMessageProcessor } from './telegram-message.processor';
@@ -126,7 +127,7 @@ export class TelegramMessageWorker
 }
 
 @Module({
-  imports: [CalendarAgentModule],
+  imports: [CalendarAgentModule, RagAgentModule],
   providers: [TelegramMessageProcessor, TelegramMessageWorker],
   exports: [TelegramMessageProcessor],
 })

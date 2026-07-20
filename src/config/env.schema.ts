@@ -104,6 +104,27 @@ export const envSchema = z.object({
 
   /** Public base URL used to build the OAuth link sent over Telegram. */
   PUBLIC_BASE_URL: z.string().url().default('http://localhost:3000'),
+
+  // --- Phase 3: RAG agent ---------------------------------------------------
+  //
+  // No API key here: embeddings run locally (all-MiniLM-L6-v2 via
+  // transformers.js), so nothing about a stored document leaves this machine.
+  // The RAG agent does still use ANTHROPIC_API_KEY above for classification,
+  // summarisation, and grounded answering.
+
+  /** Chunks retrieved per question before the relevance filter. */
+  RAG_TOP_K: z.coerce.number().int().positive().default(5),
+
+  /**
+   * Minimum cosine similarity for a chunk to be considered relevant.
+   *
+   * Vector search always returns its nearest neighbours, even when the nearest
+   * thing is unrelated — so without a floor an almost-empty knowledge base
+   * hands the model irrelevant context that reads as authoritative. 0.3 is
+   * tuned for all-MiniLM-L6-v2, whose scores run lower than larger models';
+   * revisit it if the embedding model changes.
+   */
+  RAG_SIMILARITY_THRESHOLD: z.coerce.number().min(0).max(1).default(0.3),
 });
 
 export type Env = z.infer<typeof envSchema>;

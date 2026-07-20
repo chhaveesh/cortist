@@ -2,7 +2,7 @@ import { Injectable, Logger } from '@nestjs/common';
 import {
   CURRENT_TELEGRAM_MESSAGE_JOB_VERSION,
   TELEGRAM_MESSAGE_JOB,
-  TelegramMessageJobV1,
+  TelegramMessageJobV2,
   telegramMessageJobId,
 } from '../common/contracts/telegram-message.job';
 import { IdempotencyService } from '../idempotency/idempotency.service';
@@ -101,7 +101,7 @@ export class TelegramService {
     message: ActionableMessage,
     tenantId: string,
     receivedAt: Date,
-  ): TelegramMessageJobV1 {
+  ): TelegramMessageJobV2 {
     return {
       jobType: TELEGRAM_MESSAGE_JOB,
       version: CURRENT_TELEGRAM_MESSAGE_JOB_VERSION,
@@ -111,6 +111,9 @@ export class TelegramService {
       messageId: message.messageId,
       text: message.text,
       receivedAt: receivedAt.toISOString(),
+      // Only the file reference travels — never the bytes. The worker fetches
+      // the file from Telegram when it is ready to process it.
+      ...(message.attachment ? { attachment: message.attachment } : {}),
     };
   }
 }

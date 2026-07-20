@@ -73,7 +73,8 @@ describe('Telegram webhook ingestion (integration)', () => {
 
     expect(job.data).toMatchObject({
       jobType: TELEGRAM_MESSAGE_JOB,
-      version: 1,
+      // v2 since Phase 3 added document attachments.
+      version: 2,
       tenantId: users[0].id,
       telegramUserId: String(telegramUserId),
       chatId: String(chatId),

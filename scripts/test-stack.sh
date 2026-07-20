@@ -54,17 +54,17 @@ npx prisma generate
 
 if [[ "$TIER" == "all" ]]; then
   echo "==> Running unit tests"
-  npx jest --config jest.config.js
+  NODE_OPTIONS=--experimental-vm-modules npx jest --config jest.config.js
 fi
 
 if [[ "$TIER" == "all" || "$TIER" == "integration" ]]; then
   echo "==> Running integration tests"
-  npx jest --config jest.integration.config.js --runInBand --forceExit
+  NODE_OPTIONS=--experimental-vm-modules npx jest --config jest.integration.config.js --runInBand --forceExit
 fi
 
 if [[ "$TIER" == "all" || "$TIER" == "e2e" ]]; then
   echo "==> Running end-to-end tests"
-  npx jest --config jest.e2e.config.js --runInBand --forceExit
+  NODE_OPTIONS=--experimental-vm-modules npx jest --config jest.e2e.config.js --runInBand --forceExit
 fi
 
 echo "==> Passed ($TIER)"

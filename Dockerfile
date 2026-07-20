@@ -30,6 +30,15 @@ COPY package.json package-lock.json* ./
 COPY prisma ./prisma
 RUN npm ci --omit=dev && npx prisma generate
 
+# Pre-download the local embedding model (~97MB) at build time.
+#
+# Without this the first message to reach the RAG agent triggers a download
+# from Hugging Face — which needs egress the container may not have, and adds
+# ~10s to that user's request. Baking it in makes the image bigger but the
+# runtime hermetic: no network dependency at inference, and predictable
+# cold-start.
+RUN node -e "require('@huggingface/transformers').pipeline('feature-extraction','Xenova/all-MiniLM-L6-v2').then(()=>console.log('embedding model cached')).catch(e=>{console.error('model pre-cache failed:',e.message);process.exit(1)})"
+
 # ---------- Stage 4: runtime ----------
 FROM node:22-bookworm-slim AS runtime
 ENV NODE_ENV=production

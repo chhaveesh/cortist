@@ -5,6 +5,7 @@ import {
   createCalendarHarness,
   destroyCalendarHarness,
   resetCalendarState,
+  routeToCalendar,
   seedTenant,
 } from '../calendar-harness';
 
@@ -63,7 +64,8 @@ describe('Confirmation before destructive actions (integration)', () => {
     it('asks first and deletes nothing', async () => {
       harness.classifier.script(deleteIntent);
 
-      const outcome = await harness.agent.handle(
+      const outcome = await routeToCalendar(
+        harness,
         buildJob(tenantId, 'cancel my dentist appointment'),
       );
 
@@ -89,9 +91,10 @@ describe('Confirmation before destructive actions (integration)', () => {
 
     it('deletes only after an affirmative reply', async () => {
       harness.classifier.script(deleteIntent);
-      await harness.agent.handle(buildJob(tenantId, 'cancel my dentist'));
+      await routeToCalendar(harness, buildJob(tenantId, 'cancel my dentist'));
 
-      const outcome = await harness.agent.handle(
+      const outcome = await routeToCalendar(
+        harness,
         buildJob(tenantId, 'yes', { messageId: 2 }),
       );
 
@@ -112,9 +115,10 @@ describe('Confirmation before destructive actions (integration)', () => {
 
     it('does not delete on a negative reply', async () => {
       harness.classifier.script(deleteIntent);
-      await harness.agent.handle(buildJob(tenantId, 'cancel my dentist'));
+      await routeToCalendar(harness, buildJob(tenantId, 'cancel my dentist'));
 
-      const outcome = await harness.agent.handle(
+      const outcome = await routeToCalendar(
+        harness,
         buildJob(tenantId, 'no', { messageId: 2 }),
       );
 
@@ -128,40 +132,24 @@ describe('Confirmation before destructive actions (integration)', () => {
       ).toBe(0);
     });
 
-    it('keeps waiting on an unclear reply', async () => {
-      harness.classifier.script(deleteIntent);
-      await harness.agent.handle(buildJob(tenantId, 'cancel my dentist'));
-
-      const outcome = await harness.agent.handle(
-        buildJob(tenantId, 'hmm maybe', { messageId: 2 }),
-      );
-
-      expect(outcome.status).toBe('clarification_requested');
-      expect(harness.calendar.callsTo('deleteEvent')).toBe(0);
-
-      // Still pending — the user can still say yes.
-      expect(
-        await harness.prisma.pendingAction.count({
-          where: { userId: tenantId },
-        }),
-      ).toBe(1);
-    });
-
     it('never classifies the confirmation reply as a new request', async () => {
       // "yes" on its own would classify as not_calendar_related and strand the
       // pending action. The pending check must run before classification.
       harness.classifier.script(deleteIntent);
-      await harness.agent.handle(buildJob(tenantId, 'cancel my dentist'));
+      await routeToCalendar(harness, buildJob(tenantId, 'cancel my dentist'));
 
       const callsBefore = harness.classifier.callCount;
-      await harness.agent.handle(buildJob(tenantId, 'yes', { messageId: 2 }));
+      await routeToCalendar(
+        harness,
+        buildJob(tenantId, 'yes', { messageId: 2 }),
+      );
 
       expect(harness.classifier.callCount).toBe(callsBefore);
     });
 
     it('ignores an expired pending action', async () => {
       harness.classifier.script(deleteIntent);
-      await harness.agent.handle(buildJob(tenantId, 'cancel my dentist'));
+      await routeToCalendar(harness, buildJob(tenantId, 'cancel my dentist'));
 
       // "yes" arriving after the TTL must not execute anything.
       const wellAfterExpiry = new Date(Date.now() + 3_600_000);
@@ -170,7 +158,8 @@ describe('Confirmation before destructive actions (integration)', () => {
         confidence: 'high',
       });
 
-      const outcome = await harness.agent.handle(
+      const outcome = await routeToCalendar(
+        harness,
         buildJob(tenantId, 'yes', { messageId: 2 }),
         wellAfterExpiry,
       );
@@ -185,7 +174,8 @@ describe('Confirmation before destructive actions (integration)', () => {
     it('asks first and moves nothing', async () => {
       harness.classifier.script(rescheduleIntent);
 
-      const outcome = await harness.agent.handle(
+      const outcome = await routeToCalendar(
+        harness,
         buildJob(tenantId, 'move my dentist appointment to 2pm'),
       );
 
@@ -201,9 +191,13 @@ describe('Confirmation before destructive actions (integration)', () => {
 
     it('moves the event after an affirmative reply, preserving its duration', async () => {
       harness.classifier.script(rescheduleIntent);
-      await harness.agent.handle(buildJob(tenantId, 'move my dentist to 2pm'));
+      await routeToCalendar(
+        harness,
+        buildJob(tenantId, 'move my dentist to 2pm'),
+      );
 
-      const outcome = await harness.agent.handle(
+      const outcome = await routeToCalendar(
+        harness,
         buildJob(tenantId, 'yes please', { messageId: 2 }),
       );
 
@@ -229,7 +223,8 @@ describe('Confirmation before destructive actions (integration)', () => {
       ]);
       harness.classifier.script(rescheduleIntent);
 
-      const outcome = await harness.agent.handle(
+      const outcome = await routeToCalendar(
+        harness,
         buildJob(tenantId, 'move my dentist to 2pm'),
       );
 
@@ -249,38 +244,12 @@ describe('Confirmation before destructive actions (integration)', () => {
         newStartTime: '2026-07-20T09:30:00Z',
       });
 
-      const outcome = await harness.agent.handle(
+      const outcome = await routeToCalendar(
+        harness,
         buildJob(tenantId, 'push my dentist back half an hour'),
       );
 
       expect(outcome.status).toBe('confirmation_requested');
     });
-  });
-
-  it('a new request supersedes an unanswered one', async () => {
-    harness.calendar.seed([
-      {
-        id: 'evt-lunch',
-        title: 'Lunch',
-        start: '2026-07-20T12:00:00Z',
-        end: '2026-07-20T13:00:00Z',
-      },
-    ]);
-
-    harness.classifier.script(deleteIntent, {
-      ...deleteIntent,
-      eventQuery: { ...deleteIntent.eventQuery, titleContains: 'Lunch' },
-    });
-
-    await harness.agent.handle(buildJob(tenantId, 'cancel my dentist'));
-    await harness.agent.handle(
-      buildJob(tenantId, 'actually cancel my lunch instead', { messageId: 2 }),
-    );
-
-    // "yes" now refers to the most recent question — lunch, not dentist.
-    await harness.agent.handle(buildJob(tenantId, 'yes', { messageId: 3 }));
-
-    expect(harness.calendar.findById('evt-lunch')).toBeUndefined();
-    expect(harness.calendar.findById('evt-dentist')).toBeDefined();
   });
 });

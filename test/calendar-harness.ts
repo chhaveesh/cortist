@@ -5,7 +5,6 @@ import { AppModule } from '../src/app.module';
 import { CalendarAgentService } from '../src/agents/calendar/calendar-agent.service';
 import { CalendarAgentModule } from '../src/agents/calendar/calendar-agent.module';
 import { CalendarClient } from '../src/agents/calendar/google/calendar.port';
-import { CalendarIntentClassifier } from '../src/agents/calendar/intent/calendar-intent.service';
 import { PendingActionService } from '../src/agents/calendar/pending-action/pending-action.service';
 import { registerBigIntJson } from '../src/common/bigint-json';
 import { GoogleOAuthClient } from '../src/oauth/google-oauth.client';
@@ -68,8 +67,6 @@ export async function createCalendarHarness(): Promise<CalendarHarness> {
   })
     .overrideProvider(CalendarClient)
     .useValue(calendar)
-    .overrideProvider(CalendarIntentClassifier)
-    .useValue(classifier)
     .overrideProvider(TelegramSenderService)
     .useValue(telegram)
     .overrideProvider(GoogleOAuthClient)
@@ -144,6 +141,36 @@ export async function connectCalendar(
     refreshToken: options.refreshToken ?? 'stored-refresh-token',
     expiresAt: options.expiresAt ?? new Date(Date.now() + 3_600_000),
   });
+}
+
+/**
+ * A minimal stand-in for the router's dispatch, so agent-focused tests keep
+ * testing the agent.
+ *
+ * Since Phase 4a the agent no longer classifies — the router does, once, and
+ * hands over a pre-extracted intent. These tests care about conflict detection,
+ * confirmation, and tenant behaviour rather than routing, so this helper
+ * reproduces just the two steps the router performs before the agent runs:
+ * check for an outstanding follow-up, otherwise classify and dispatch.
+ *
+ * Routing itself is covered by the router's own suites.
+ */
+export async function routeToCalendar(
+  harness: CalendarHarness,
+  job: Parameters<CalendarAgentService['handle']>[0],
+  now?: Date,
+) {
+  if (await harness.agent.claimsFollowUp(job.tenantId, now)) {
+    return harness.agent.handleFollowUp(job, now);
+  }
+
+  const intent = await harness.classifier.classify({
+    text: job.text,
+    timeZone: 'Europe/London',
+    now: now ?? new Date(),
+  });
+
+  return harness.agent.handle(job, intent, now);
 }
 
 /** Builds a queue job payload, as the gateway would have produced it. */

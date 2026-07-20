@@ -5,6 +5,7 @@ import {
   createCalendarHarness,
   destroyCalendarHarness,
   resetCalendarState,
+  routeToCalendar,
   seedTenant,
 } from '../calendar-harness';
 
@@ -46,7 +47,8 @@ describe('Ambiguous event resolution (integration)', () => {
   it('says so when nothing matches', async () => {
     harness.classifier.script(deleteQuery('dentist'));
 
-    const outcome = await harness.agent.handle(
+    const outcome = await routeToCalendar(
+      harness,
       buildJob(tenantId, 'cancel my dentist appointment'),
     );
 
@@ -81,7 +83,8 @@ describe('Ambiguous event resolution (integration)', () => {
     ]);
     harness.classifier.script(deleteQuery('Call'));
 
-    const outcome = await harness.agent.handle(
+    const outcome = await routeToCalendar(
+      harness,
       buildJob(tenantId, 'cancel my call'),
     );
 
@@ -113,7 +116,8 @@ describe('Ambiguous event resolution (integration)', () => {
     ]);
     harness.classifier.script(deleteQuery('Call'));
 
-    const outcome = await harness.agent.handle(
+    const outcome = await routeToCalendar(
+      harness,
       buildJob(tenantId, 'cancel my call with Priya'),
     );
 
@@ -143,7 +147,8 @@ describe('Ambiguous event resolution (integration)', () => {
     ]);
     harness.classifier.script(deleteQuery('Meeting'));
 
-    const outcome = await harness.agent.handle(
+    const outcome = await routeToCalendar(
+      harness,
       buildJob(tenantId, 'cancel my meeting'),
     );
 
@@ -165,12 +170,13 @@ describe('Ambiguous event resolution (integration)', () => {
     ]);
     harness.classifier.script(deleteQuery('Dentist'));
 
-    await harness.agent.handle(buildJob(tenantId, 'cancel my dentist'));
+    await routeToCalendar(harness, buildJob(tenantId, 'cancel my dentist'));
 
     // Someone deletes it from Google's UI while we wait for the reply.
     harness.calendar.failNextWith('not_found');
 
-    const outcome = await harness.agent.handle(
+    const outcome = await routeToCalendar(
+      harness,
       buildJob(tenantId, 'yes', { messageId: 2 }),
     );
 

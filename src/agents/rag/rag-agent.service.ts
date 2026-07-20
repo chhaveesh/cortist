@@ -13,8 +13,9 @@ import {
 import { HtmlExtractor } from './ingestion/extractors/html.extractor';
 import { PdfExtractor } from './ingestion/extractors/pdf.extractor';
 import { UrlFetcher } from './ingestion/url-fetcher.port';
-import { looksRagRelated, firstUrlIn } from './intent/rag-keyword-filter';
+import { firstUrlIn } from './intent/rag-keyword-filter';
 import { RagLlm } from './intent/rag-llm.service';
+import { RagIntent } from './intent/rag-intent.schema';
 import { RetrievalService } from './retrieval/retrieval.service';
 
 export type RagAgentOutcome =
@@ -50,21 +51,32 @@ export class RagAgentService {
     private readonly telegram: TelegramSenderService,
   ) {}
 
-  async handle(job: TelegramMessageJob): Promise<RagAgentOutcome> {
+  /**
+   * Acts on a message the router has already classified as knowledge work.
+   *
+   * The agent no longer decides whether a message is its business, and no
+   * longer classifies: `intent` arrives pre-extracted from the router's single
+   * classification. `null` means an attachment, which needs no classification
+   * at all — a PDF upload is unambiguous.
+   */
+  async handle(
+    job: TelegramMessageJob,
+    intent: RagIntent | null,
+  ): Promise<RagAgentOutcome> {
     const attachment = attachmentOf(job);
 
     try {
-      // An upload is unambiguous — no classification needed, and no LLM call
-      // spent deciding whether a PDF is worth storing.
       if (attachment) {
         return await this.ingestAttachment(job, attachment);
       }
 
-      if (!looksRagRelated(job.text)) {
-        return { status: 'skipped', reason: 'prefiltered' };
+      if (!intent) {
+        // Nothing to act on and no file: the router should not have sent this.
+        this.logger.warn(
+          `RAG agent received message ${job.messageId} with no intent and no attachment`,
+        );
+        return { status: 'skipped', reason: 'not_rag_related' };
       }
-
-      const intent = await this.llm.classify(job.text, false);
 
       switch (intent.intent) {
         case 'store':

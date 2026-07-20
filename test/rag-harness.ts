@@ -121,6 +121,24 @@ export async function seedRagTenant(
   return user.id;
 }
 
+/**
+ * A minimal stand-in for the router's dispatch — see the calendar harness note.
+ *
+ * An attachment carries no intent: uploads are unambiguous and the router sends
+ * them straight to ingestion without classifying.
+ */
+export async function routeToRag(
+  harness: RagHarness,
+  job: Parameters<RagAgentService['handle']>[0],
+) {
+  if (job.version === 2 && job.attachment) {
+    return harness.agent.handle(job, null);
+  }
+
+  const intent = await harness.llm.classify(job.text);
+  return harness.agent.handle(job, intent);
+}
+
 /** Builds a v2 job payload, as the gateway would produce it. */
 export function buildRagJob(
   tenantId: string,

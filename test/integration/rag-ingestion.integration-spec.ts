@@ -6,6 +6,7 @@ import {
   createRagHarness,
   destroyRagHarness,
   resetRagState,
+  routeToRag,
   seedRagTenant,
 } from '../rag-harness';
 
@@ -41,7 +42,8 @@ describe('RAG ingestion (integration)', () => {
         tags: ['api', 'limits'],
       });
 
-      const outcome = await harness.agent.handle(
+      const outcome = await routeToRag(
+        harness,
         buildRagJob(
           tenantId,
           'save this: The API rate limit is 1000 requests per minute per key.',
@@ -81,7 +83,7 @@ describe('RAG ingestion (integration)', () => {
         content: 'Something worth remembering about the system.',
       });
 
-      await harness.agent.handle(buildRagJob(tenantId, 'remember this: ...'));
+      await routeToRag(harness, buildRagJob(tenantId, 'remember this: ...'));
 
       expect(harness.embeddings.calls[0].inputType).toBe('document');
     });
@@ -99,7 +101,7 @@ describe('RAG ingestion (integration)', () => {
         content: long,
       });
 
-      await harness.agent.handle(buildRagJob(tenantId, 'save this: ...'));
+      await routeToRag(harness, buildRagJob(tenantId, 'save this: ...'));
 
       const chunks = await harness.prisma.documentChunk.findMany({
         where: { userId: tenantId },
@@ -117,7 +119,8 @@ describe('RAG ingestion (integration)', () => {
     it('ingests a real PDF end to end', async () => {
       harness.files.register('file-pdf-1', fixture('sample.pdf'));
 
-      const outcome = await harness.agent.handle(
+      const outcome = await routeToRag(
+        harness,
         buildRagJob(tenantId, '', {
           attachment: {
             fileId: 'file-pdf-1',
@@ -144,7 +147,8 @@ describe('RAG ingestion (integration)', () => {
         'Meeting notes: ship the thing on Friday.',
       );
 
-      const outcome = await harness.agent.handle(
+      const outcome = await routeToRag(
+        harness,
         buildRagJob(tenantId, '', {
           attachment: {
             fileId: 'file-txt-1',
@@ -163,7 +167,8 @@ describe('RAG ingestion (integration)', () => {
     });
 
     it('refuses an unsupported file type without downloading it', async () => {
-      const outcome = await harness.agent.handle(
+      const outcome = await routeToRag(
+        harness,
         buildRagJob(tenantId, '', {
           attachment: {
             fileId: 'file-zip',
@@ -182,7 +187,8 @@ describe('RAG ingestion (integration)', () => {
     it('refuses an oversized file before spending a download', async () => {
       // Telegram refuses bot downloads above 20MB anyway, so the request would
       // only produce a worse error.
-      const outcome = await harness.agent.handle(
+      const outcome = await routeToRag(
+        harness,
         buildRagJob(tenantId, '', {
           attachment: {
             fileId: 'file-big',
@@ -201,7 +207,8 @@ describe('RAG ingestion (integration)', () => {
     it('reports an unreadable PDF to the user and stores nothing', async () => {
       harness.files.register('file-bad', Buffer.from('not really a pdf'));
 
-      const outcome = await harness.agent.handle(
+      const outcome = await routeToRag(
+        harness,
         buildRagJob(tenantId, '', {
           attachment: {
             fileId: 'file-bad',
@@ -232,7 +239,8 @@ describe('RAG ingestion (integration)', () => {
         content: 'save this https://example.com/vectors',
       });
 
-      const outcome = await harness.agent.handle(
+      const outcome = await routeToRag(
+        harness,
         buildRagJob(tenantId, 'save this https://example.com/vectors'),
       );
 
@@ -267,7 +275,8 @@ describe('RAG ingestion (integration)', () => {
         content: 'save https://example.com/gone',
       });
 
-      const outcome = await harness.agent.handle(
+      const outcome = await routeToRag(
+        harness,
         buildRagJob(tenantId, 'save https://example.com/gone'),
       );
 
@@ -280,20 +289,12 @@ describe('RAG ingestion (integration)', () => {
   it('skips a message that is not about stored knowledge', async () => {
     harness.llm.scriptIntent({ intent: 'not_rag_related', confidence: 'high' });
 
-    const outcome = await harness.agent.handle(
+    const outcome = await routeToRag(
+      harness,
       buildRagJob(tenantId, 'what is the capital of France?'),
     );
 
     expect(outcome).toEqual({ status: 'skipped', reason: 'not_rag_related' });
     expect(harness.telegram.sent).toEqual([]);
-  });
-
-  it('skips without an LLM call when the pre-filter finds nothing', async () => {
-    const outcome = await harness.agent.handle(
-      buildRagJob(tenantId, 'thanks!'),
-    );
-
-    expect(outcome).toEqual({ status: 'skipped', reason: 'prefiltered' });
-    expect(harness.llm.classifyCalls).toEqual([]);
   });
 });

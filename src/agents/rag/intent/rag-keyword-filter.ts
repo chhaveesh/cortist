@@ -25,7 +25,10 @@ const PATTERNS: RegExp[] = [
   /\b(my )?(notes?|documents?|docs?|files?|brain|knowledge base)\b/i,
   /\bwhat did .* (say|mention|state)\b/i,
   /\baccording to\b/i,
-  /\bthe (report|paper|article|doc|document|pdf)\b/i,
+  // Allows a modifier or two between the article and the noun: "the Q3
+  // report" and "the quarterly report" both failed the stricter form, which
+  // dropped a whole class of plausible requests before classification.
+  /\bthe (\w+ ){0,2}(reports?|papers?|articles?|docs?|documents?|pdfs?)\b/i,
   /\bi (saved|stored|uploaded|sent you)\b/i,
 
   // Question shapes — resolved by the classifier, not here

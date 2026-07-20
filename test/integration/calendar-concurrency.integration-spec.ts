@@ -5,6 +5,7 @@ import {
   createCalendarHarness,
   destroyCalendarHarness,
   resetCalendarState,
+  routeToCalendar,
   seedTenant,
 } from '../calendar-harness';
 
@@ -50,11 +51,16 @@ describe('Concurrent calendar requests for one tenant (integration)', () => {
     );
 
     const outcomes = await Promise.all([
-      harness.agent.handle(
+      routeToCalendar(
+        harness,
         buildJob(tenantId, 'book morning', { messageId: 1 }),
       ),
-      harness.agent.handle(buildJob(tenantId, 'book midday', { messageId: 2 })),
-      harness.agent.handle(
+      routeToCalendar(
+        harness,
+        buildJob(tenantId, 'book midday', { messageId: 2 }),
+      ),
+      routeToCalendar(
+        harness,
         buildJob(tenantId, 'book evening', { messageId: 3 }),
       ),
     ]);
@@ -73,10 +79,12 @@ describe('Concurrent calendar requests for one tenant (integration)', () => {
     );
 
     const outcomes = await Promise.all([
-      harness.agent.handle(
+      routeToCalendar(
+        harness,
         buildJob(tenantId, 'book dentist', { messageId: 1 }),
       ),
-      harness.agent.handle(
+      routeToCalendar(
+        harness,
         buildJob(tenantId, 'book dentist', { messageId: 2 }),
       ),
     ]);
@@ -123,10 +131,12 @@ describe('Concurrent calendar requests for one tenant (integration)', () => {
     harness.calendar.blockCreates();
 
     const inFlight = Promise.all([
-      harness.agent.handle(
+      routeToCalendar(
+        harness,
         buildJob(tenantId, 'book dentist', { messageId: 1 }),
       ),
-      harness.agent.handle(
+      routeToCalendar(
+        harness,
         buildJob(tenantId, 'book dentist', { messageId: 2 }),
       ),
     ]);
@@ -188,10 +198,14 @@ describe('Concurrent calendar requests for one tenant (integration)', () => {
     harness.classifier.script(deleteIntent('Alpha'), deleteIntent('Beta'));
 
     await Promise.all([
-      harness.agent.handle(
+      routeToCalendar(
+        harness,
         buildJob(tenantId, 'cancel alpha', { messageId: 1 }),
       ),
-      harness.agent.handle(buildJob(tenantId, 'cancel beta', { messageId: 2 })),
+      routeToCalendar(
+        harness,
+        buildJob(tenantId, 'cancel beta', { messageId: 2 }),
+      ),
     ]);
 
     const pending = await harness.prisma.pendingAction.findMany({
@@ -225,11 +239,11 @@ describe('Concurrent calendar requests for one tenant (integration)', () => {
       },
     });
 
-    await harness.agent.handle(buildJob(tenantId, 'cancel my dentist'));
+    await routeToCalendar(harness, buildJob(tenantId, 'cancel my dentist'));
 
     const outcomes = await Promise.all([
-      harness.agent.handle(buildJob(tenantId, 'yes', { messageId: 2 })),
-      harness.agent.handle(buildJob(tenantId, 'yes', { messageId: 3 })),
+      routeToCalendar(harness, buildJob(tenantId, 'yes', { messageId: 2 })),
+      routeToCalendar(harness, buildJob(tenantId, 'yes', { messageId: 3 })),
     ]);
 
     // The pending row is cleared before execution, so at most one "yes" can

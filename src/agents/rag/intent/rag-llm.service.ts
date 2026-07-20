@@ -6,14 +6,10 @@ import { Env } from '../../../config/env.schema';
 import {
   DocumentSummary,
   GroundedAnswer,
-  RagIntent,
   documentSummaryJsonSchema,
   documentSummarySchema,
   groundedAnswerJsonSchema,
   groundedAnswerSchema,
-  narrowRagIntent,
-  ragExtractionJsonSchema,
-  ragExtractionSchema,
 } from './rag-intent.schema';
 
 export interface AnswerSource {
@@ -26,8 +22,6 @@ export interface AnswerSource {
  * single fake instead of three.
  */
 export abstract class RagLlm {
-  abstract classify(text: string, hasAttachment: boolean): Promise<RagIntent>;
-
   /** One summary + tags per document, over the full text — not per chunk. */
   abstract summarize(
     text: string,
@@ -40,14 +34,6 @@ export abstract class RagLlm {
     sources: AnswerSource[],
   ): Promise<GroundedAnswer>;
 }
-
-const CLASSIFY_PROMPT = `You classify a message sent to a personal "second brain" assistant that stores documents and answers questions about them.
-
-- store: the user wants something remembered. Explicit triggers ("save this", "remember this", "note this down"), a pasted URL to keep, or an uploaded file. Extract the content to store WITHOUT the trigger phrase.
-- query: the user is asking a question that should be answered from their previously stored documents ("what did that report say about X", "what do I know about Y").
-- not_rag_related: anything else — chit-chat, calendar requests, general knowledge questions that do not reference stored material.
-
-A general knowledge question the user could ask any assistant ("what is the capital of France") is NOT a query against stored knowledge. Prefer not_rag_related when unsure.`;
 
 const ANSWER_PROMPT = `You answer questions using ONLY the sources provided. This is a personal knowledge base, where a confident wrong answer is far worse than admitting the answer is not there.
 
@@ -69,35 +55,6 @@ export class AnthropicRagLlm extends RagLlm {
       apiKey: config.get('ANTHROPIC_API_KEY', { infer: true }),
     });
     this.model = config.get('ANTHROPIC_MODEL', { infer: true });
-  }
-
-  async classify(text: string, hasAttachment: boolean): Promise<RagIntent> {
-    const response = await this.client.messages.parse({
-      model: this.model,
-      max_tokens: 2048,
-      system: CLASSIFY_PROMPT,
-      output_config: {
-        format: jsonSchemaOutputFormat(ragExtractionJsonSchema),
-      },
-      messages: [
-        {
-          role: 'user',
-          content: hasAttachment
-            ? `The user uploaded a file with this caption: ${JSON.stringify(text)}`
-            : `Message: ${JSON.stringify(text)}`,
-        },
-      ],
-    });
-
-    const parsed = ragExtractionSchema.safeParse(response.parsed_output);
-    if (!parsed.success) {
-      this.logger.warn(
-        `RAG classification produced no usable output (stop_reason=${response.stop_reason})`,
-      );
-      return { intent: 'not_rag_related', confidence: 'low' };
-    }
-
-    return narrowRagIntent(parsed.data);
   }
 
   async summarize(text: string, sourceName: string): Promise<DocumentSummary> {

@@ -1,7 +1,7 @@
 {
   "name": "cortist",
   "version": "0.1.0",
-  "description": "Cortist \u2014 Telegram ingestion gateway and message queue (Phase 1)",
+  "description": "Cortist — Telegram ingestion gateway and message queue (Phase 1)",
   "private": true,
   "license": "UNLICENSED",
   "scripts": {
@@ -24,7 +24,8 @@
     "test:e2e:only": "./scripts/test-stack.sh e2e",
     "lint:fix": "eslint \"{src,test}/**/*.ts\" --fix",
     "format:check": "prettier --check \"{src,test}/**/*.ts\"",
-    "eval:intent": "ts-node -P tsconfig.json scripts/eval-intent.ts"
+    "eval:intent": "ts-node -P tsconfig.json scripts/eval-intent.ts",
+    "eval:router": "ts-node -P tsconfig.json scripts/eval-router.ts"
   },
   "dependencies": {
     "@anthropic-ai/sdk": "^0.112.3",

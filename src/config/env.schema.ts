@@ -125,6 +125,20 @@ export const envSchema = z.object({
    * revisit it if the embedding model changes.
    */
   RAG_SIMILARITY_THRESHOLD: z.coerce.number().min(0).max(1).default(0.3),
+
+  // --- Phase 4a: intent router ---------------------------------------------
+
+  /**
+   * How long an unanswered routing question survives, in seconds.
+   *
+   * Shorter than the calendar confirmation TTL: "did you mean your calendar or
+   * your notes?" stops making sense once the user has moved on, whereas a
+   * pending delete is still meaningful minutes later.
+   */
+  CLARIFICATION_TTL_SECONDS: z.coerce.number().int().positive().default(180),
+
+  /** Timezone used for relative-time extraction when a user has none stored. */
+  DEFAULT_TIMEZONE: z.string().min(1).default('UTC'),
 });
 
 export type Env = z.infer<typeof envSchema>;

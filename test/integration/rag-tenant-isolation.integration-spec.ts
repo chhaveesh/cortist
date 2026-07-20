@@ -4,6 +4,7 @@ import {
   createRagHarness,
   destroyRagHarness,
   resetRagState,
+  routeToRag,
   seedRagTenant,
 } from '../rag-harness';
 
@@ -176,7 +177,8 @@ describe('RAG tenant isolation (integration)', () => {
       question: 'What is the Nightingale budget?',
     });
 
-    await harness.agent.handle(
+    await routeToRag(
+      harness,
       buildRagJob(alice, 'what do my notes say about the Nightingale budget?'),
     );
 

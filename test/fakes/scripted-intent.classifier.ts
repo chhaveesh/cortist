@@ -1,18 +1,19 @@
 import { CalendarIntent } from '../../src/agents/calendar/intent/calendar-intent.schema';
-import {
-  CalendarIntentClassifier,
-  ClassifyInput,
-} from '../../src/agents/calendar/intent/calendar-intent.service';
+export interface ClassifyInput {
+  text: string;
+  timeZone: string;
+  now: Date;
+}
 
 /**
- * A classifier that returns whatever the test told it to.
+ * Supplies calendar intents to agent-focused tests.
  *
- * Bound to the `CalendarIntentClassifier` token, this is what keeps Anthropic
- * out of CI. It also records each `ClassifyInput`, so tests can assert that the
- * agent passed the right timezone and current time — the two things the model
- * needs to resolve "tomorrow at 3pm" correctly.
+ * Since Phase 4a the calendar agent no longer classifies — the router hands it
+ * a pre-extracted intent — so this is a plain test helper rather than a bound
+ * provider. It stands in for the router's extraction so those suites can keep
+ * testing conflict detection, confirmation, and tenant behaviour directly.
  */
-export class ScriptedIntentClassifier extends CalendarIntentClassifier {
+export class ScriptedIntentClassifier {
   private queue: CalendarIntent[] = [];
   readonly received: ClassifyInput[] = [];
 

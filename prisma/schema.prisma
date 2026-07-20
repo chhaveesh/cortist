@@ -21,10 +21,18 @@ model User {
   id             String   @id @default(uuid()) @db.Uuid
   telegramUserId BigInt   @unique @map("telegram_user_id")
   telegramChatId BigInt   @map("telegram_chat_id")
+  /// IANA zone, cached from the user's primary calendar.
+  ///
+  /// Stored rather than fetched per message for two reasons: the router needs
+  /// it to resolve "tomorrow at 3pm" during extraction and has no calendar
+  /// access, and fetching it previously cost an extra Google API call on every
+  /// single calendar message.
+  timeZone       String?  @map("time_zone")
   createdAt      DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
 
-  oauthTokens    OAuthToken[]
-  pendingAction  PendingAction?
+  oauthTokens         OAuthToken[]
+  pendingAction       PendingAction?
+  pendingClarification PendingClarification?
   documents      Document[]
   documentChunks DocumentChunk[]
 
@@ -131,4 +139,29 @@ model ProcessedMessage {
 
   @@unique([chatId, messageId], map: "processed_messages_chat_id_message_id_key")
   @@map("processed_messages")
+}
+
+/// A routing question awaiting the user's answer.
+///
+/// Separate from PendingAction: that one guards a destructive calendar action,
+/// this one resolves which agent a message belongs to. Conflating them would
+/// mean a "yes" could mean either "delete the event" or "the calendar one",
+/// which is exactly the ambiguity this table exists to remove.
+model PendingClarification {
+  id           String   @id @default(uuid()) @db.Uuid
+  userId       String   @unique @map("user_id") @db.Uuid
+  /// The message we could not route, replayed verbatim once the user answers.
+  originalText String   @map("original_text")
+  /// The two routes the classifier was torn between.
+  routeA       String   @map("route_a")
+  routeB       String   @map("route_b")
+  /// How many times we have already asked. Capped to stop a loop.
+  attempts     Int      @default(1)
+  expiresAt    DateTime @map("expires_at") @db.Timestamptz(6)
+  createdAt    DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([expiresAt], map: "pending_clarifications_expires_at_idx")
+  @@map("pending_clarifications")
 }

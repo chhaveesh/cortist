@@ -1,5 +1,6 @@
 import { Injectable, Logger } from '@nestjs/common';
 import { CalendarConfigService } from '../../config/calendar-config.service';
+import { PrismaService } from '../../prisma/prisma.service';
 import { TelegramMessageJob } from '../../common/contracts/telegram-message.job';
 import {
   MissingOAuthConnectionError,
@@ -14,8 +15,6 @@ import {
   CalendarClient,
   CalendarEvent,
 } from './google/calendar.port';
-import { CalendarIntentClassifier } from './intent/calendar-intent.service';
-import { looksCalendarRelated } from './intent/calendar-keyword-filter';
 import { CalendarIntent, EventQuery } from './intent/calendar-intent.schema';
 import { interpretConfirmation } from './pending-action/confirmation-reply';
 import {
@@ -40,6 +39,7 @@ export type CalendarAgentOutcome =
     }
   | { status: 'confirmed'; actionType: PendingActionPayload['type'] }
   | { status: 'declined' }
+  | { status: 'unclear_reply' }
   | { status: 'event_not_found' }
   | { status: 'ambiguous_event'; candidates: number }
   | { status: 'error'; message: string };
@@ -67,55 +67,85 @@ export class CalendarAgentService {
 
   constructor(
     private readonly calendarConfig: CalendarConfigService,
-    private readonly classifier: CalendarIntentClassifier,
     private readonly calendar: CalendarClient,
     private readonly conflicts: ConflictDetectorService,
     private readonly pending: PendingActionService,
     private readonly tokens: OAuthTokenService,
     private readonly oauthState: OAuthStateService,
     private readonly telegram: TelegramSenderService,
+    private readonly prisma: PrismaService,
   ) {}
 
-  async handle(
+  /**
+   * True when this agent is waiting on the tenant's next message.
+   *
+   * The router asks this BEFORE classifying, because a reply like "yes"
+   * classifies as unrelated and would otherwise strand the pending action —
+   * silently breaking every delete and reschedule confirmation.
+   */
+  async claimsFollowUp(tenantId: string, now = new Date()): Promise<boolean> {
+    return (await this.pending.get(tenantId, now)) !== null;
+  }
+
+  /**
+   * Handles a reply to an outstanding confirmation.
+   *
+   * Only called when `claimsFollowUp` returned true, so a pending action is
+   * expected — but it is re-read rather than assumed, since it can expire
+   * between the two calls.
+   */
+  async handleFollowUp(
     job: TelegramMessageJob,
     now = new Date(),
   ): Promise<CalendarAgentOutcome> {
-    // 1. An outstanding confirmation takes priority over anything else.
-    //
-    // This must run BEFORE classification: "yes" on its own classifies as
-    // not-calendar-related, which would strand the pending action forever.
     const pendingAction = await this.pending.get(job.tenantId, now);
-    if (pendingAction) {
-      const reply = interpretConfirmation(job.text);
-
-      if (reply !== 'unclear') {
-        return this.handleConfirmationReply(job, pendingAction, reply);
-      }
-
-      // Neither yes nor no. It is either a garbled answer, or the user changing
-      // their mind ("actually, cancel my lunch instead").
-      //
-      // Telling those apart uses the real classifier, not the keyword filter.
-      // The filter is a generous heuristic tuned for recall, and letting a
-      // false positive — it once matched "maybe" — discard a pending
-      // confirmation is the wrong thing to hang a destructive-action decision
-      // on. Superseding is safe (it only ever cancels a pending action, never
-      // performs one), but it should still be driven by an actual reading of
-      // the message.
-      return this.handleUnclearReply(job, pendingAction, now);
+    if (!pendingAction) {
+      return { status: 'skipped', reason: 'not_calendar_related' };
     }
 
-    // 2. Cheap filter before spending an LLM call.
-    if (!looksCalendarRelated(job.text)) {
-      this.logger.debug(
-        `Pre-filtered as non-calendar: ${JSON.stringify(job.text)}`,
-      );
-      return { status: 'skipped', reason: 'prefiltered' };
+    const reply = interpretConfirmation(job.text);
+
+    if (reply !== 'unclear') {
+      return this.handleConfirmationReply(job, pendingAction, reply);
     }
 
-    // 3. Credentials present? Checked after the pre-filter so an unconfigured
-    // deployment stays silent on non-calendar chatter, and before anything
-    // touches Google or Anthropic.
+    // Neither yes nor no — it is either a garbled answer or the user changing
+    // their mind ("actually, cancel my lunch instead").
+    //
+    // Deliberately returns WITHOUT messaging the user. Telling those two apart
+    // needs a classification, and since Phase 4a that belongs to the router.
+    // Replying here would mean the user gets "I need a yes or no" even when
+    // they had clearly moved on — the exact behaviour §25 established should
+    // not happen.
+    return { status: 'unclear_reply' };
+  }
+
+  /** Drops a pending action the router has decided is superseded. */
+  async cancelPendingAction(tenantId: string): Promise<void> {
+    await this.pending.clear(tenantId);
+  }
+
+  /** The re-ask, sent by the router once it knows this was not a new request. */
+  async askForClearConfirmation(job: TelegramMessageJob): Promise<void> {
+    await this.telegram.sendMessage(
+      job.chatId,
+      'Sorry, I need a clear yes or no first — reply "yes" to go ahead, or "no" to cancel.',
+    );
+  }
+
+  /**
+   * Acts on a message the router has already classified as calendar work.
+   *
+   * The agent no longer decides whether a message is its business, and no
+   * longer classifies: `intent` arrives pre-extracted from the router's single
+   * classification. What stays here is everything that needs calendar context —
+   * credentials, connection state, conflict detection, and confirmation.
+   */
+  async handle(
+    job: TelegramMessageJob,
+    intent: CalendarIntent,
+    now = new Date(),
+  ): Promise<CalendarAgentOutcome> {
     if (!this.calendarConfig.isConfigured) {
       const missing = this.calendarConfig.missingVars;
       this.logger.error(
@@ -132,7 +162,6 @@ export class CalendarAgentService {
       return { status: 'not_configured', missing };
     }
 
-    // 4. No connection means we cannot act — send the OAuth link instead.
     if (!(await this.tokens.hasConnection(job.tenantId))) {
       await this.sendConnectPrompt(job);
       return { status: 'needs_connection' };
@@ -157,7 +186,15 @@ export class CalendarAgentService {
     }
 
     try {
-      return await this.route(job, accessToken, now);
+      // The timezone is still read from the calendar here — the router used the
+      // cached value for extraction, and this refreshes the cache as a side
+      // effect of work we were doing anyway.
+      const timeZone = await this.resolveTimeZone(
+        accessToken,
+        now,
+        job.tenantId,
+      );
+      return await this.dispatch(job, intent, accessToken, timeZone, now);
     } catch (error) {
       if (error instanceof CalendarApiError) {
         return this.handleCalendarError(job, error);
@@ -169,24 +206,6 @@ export class CalendarAgentService {
   // -------------------------------------------------------------------------
   // Intent routing
   // -------------------------------------------------------------------------
-
-  private async route(
-    job: TelegramMessageJob,
-    accessToken: string,
-    now: Date,
-  ): Promise<CalendarAgentOutcome> {
-    // The calendar's own timezone anchors every relative time the model
-    // resolves, and comes back on a list call — no extra OAuth scope needed.
-    const timeZone = await this.resolveTimeZone(accessToken, now);
-
-    const intent = await this.classifier.classify({
-      text: job.text,
-      timeZone,
-      now,
-    });
-
-    return this.dispatch(job, intent, accessToken, timeZone, now);
-  }
 
   private async dispatch(
     job: TelegramMessageJob,
@@ -391,76 +410,6 @@ export class CalendarAgentService {
   // -------------------------------------------------------------------------
 
   /**
-   * Resolves a reply that is neither yes nor no while an action is pending.
-   *
-   * Runs the classifier: an actionable calendar intent means the user moved on,
-   * so the pending action is superseded and the new request handled. Anything
-   * else means they answered the question badly — keep it pending and re-ask,
-   * because dropping it would quietly lose a confirmation they may still give.
-   */
-  private async handleUnclearReply(
-    job: TelegramMessageJob,
-    pendingAction: PendingActionPayload,
-    now: Date,
-  ): Promise<CalendarAgentOutcome> {
-    const reAsk = async (): Promise<CalendarAgentOutcome> => {
-      await this.telegram.sendMessage(
-        job.chatId,
-        'Sorry, I need a clear yes or no first — reply "yes" to go ahead, or "no" to cancel.',
-      );
-      return { status: 'clarification_requested' };
-    };
-
-    // Not remotely calendar-shaped — no point paying for a classification.
-    if (!looksCalendarRelated(job.text)) {
-      return reAsk();
-    }
-
-    let accessToken: string;
-    try {
-      accessToken = await this.tokens.getAccessToken(
-        job.tenantId,
-        undefined,
-        now,
-      );
-    } catch {
-      // Cannot classify meaningfully without a calendar; keep the action
-      // pending rather than discarding it on an infrastructure problem.
-      return reAsk();
-    }
-
-    const timeZone = await this.resolveTimeZone(accessToken, now);
-    const intent = await this.classifier.classify({
-      text: job.text,
-      timeZone,
-      now,
-    });
-
-    const isNewRequest =
-      intent.intent === 'create_event' ||
-      intent.intent === 'reschedule_event' ||
-      intent.intent === 'delete_event';
-
-    if (!isNewRequest) {
-      return reAsk();
-    }
-
-    this.logger.debug(
-      `New ${intent.intent} superseded a pending ${pendingAction.type} for ${job.tenantId}`,
-    );
-    await this.pending.clear(job.tenantId);
-
-    try {
-      return await this.dispatch(job, intent, accessToken, timeZone, now);
-    } catch (error) {
-      if (error instanceof CalendarApiError) {
-        return this.handleCalendarError(job, error);
-      }
-      throw error;
-    }
-  }
-
-  /**
    * Executes or declines a pending action. Only ever called with a decisive
    * reply — `unclear` is resolved by `handleUnclearReply`.
    */
@@ -610,9 +559,17 @@ export class CalendarAgentService {
   // Helpers
   // -------------------------------------------------------------------------
 
+  /**
+   * The calendar's timezone, refreshed into the users table as a side effect.
+   *
+   * The router reads the cached value to resolve relative times during
+   * extraction, so keeping it current matters — but it is written here, on a
+   * call we were making anyway, rather than costing a request of its own.
+   */
   private async resolveTimeZone(
     accessToken: string,
     now: Date,
+    tenantId: string,
   ): Promise<string> {
     // A one-hour lookahead is the cheapest call that still returns the
     // calendar's timeZone field.
@@ -621,6 +578,12 @@ export class CalendarAgentService {
       timeMax: new Date(now.getTime() + 3_600_000).toISOString(),
       maxResults: 1,
     });
+
+    // Best effort: a failed cache write must not fail the user's request.
+    await this.prisma.user
+      .update({ where: { id: tenantId }, data: { timeZone } })
+      .catch(() => undefined);
+
     return timeZone;
   }
 

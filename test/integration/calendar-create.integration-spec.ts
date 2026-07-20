@@ -5,6 +5,7 @@ import {
   createCalendarHarness,
   destroyCalendarHarness,
   resetCalendarState,
+  routeToCalendar,
   seedTenant,
 } from '../calendar-harness';
 
@@ -40,7 +41,8 @@ describe('Calendar create + conflict detection (integration)', () => {
   it('creates the event when the slot is free, and confirms it', async () => {
     harness.classifier.script(createIntent());
 
-    const outcome = await harness.agent.handle(
+    const outcome = await routeToCalendar(
+      harness,
       buildJob(tenantId, 'book a dentist appointment tomorrow at 9'),
     );
 
@@ -66,7 +68,8 @@ describe('Calendar create + conflict detection (integration)', () => {
     ]);
     harness.classifier.script(createIntent());
 
-    const outcome = await harness.agent.handle(
+    const outcome = await routeToCalendar(
+      harness,
       buildJob(tenantId, 'book a dentist appointment tomorrow at 9'),
     );
 
@@ -93,28 +96,12 @@ describe('Calendar create + conflict detection (integration)', () => {
     ]);
     harness.classifier.script(createIntent());
 
-    const outcome = await harness.agent.handle(
+    const outcome = await routeToCalendar(
+      harness,
       buildJob(tenantId, 'book a dentist appointment tomorrow at 9'),
     );
 
     expect(outcome.status).toBe('event_created');
-  });
-
-  it('passes the calendar timezone and current time to the classifier', async () => {
-    // These two inputs are what let the model resolve "tomorrow at 3pm"
-    // correctly; if they stop being passed, the failure is silent and subtle.
-    harness.calendar.setTimeZone('America/New_York');
-    harness.classifier.script(createIntent());
-
-    const before = new Date();
-    await harness.agent.handle(buildJob(tenantId, 'dentist tomorrow at 9'));
-
-    expect(harness.classifier.received).toHaveLength(1);
-    expect(harness.classifier.received[0].timeZone).toBe('America/New_York');
-    expect(harness.classifier.received[0].now.getTime()).toBeGreaterThanOrEqual(
-      before.getTime() - 1000,
-    );
-    expect(harness.classifier.received[0].text).toBe('dentist tomorrow at 9');
   });
 
   it('asks a clarifying question instead of guessing', async () => {
@@ -124,7 +111,8 @@ describe('Calendar create + conflict detection (integration)', () => {
       question: 'What time should the dentist appointment be?',
     });
 
-    const outcome = await harness.agent.handle(
+    const outcome = await routeToCalendar(
+      harness,
       buildJob(tenantId, 'book me a dentist appointment'),
     );
 
@@ -141,7 +129,8 @@ describe('Calendar create + conflict detection (integration)', () => {
       confidence: 'high',
     });
 
-    const outcome = await harness.agent.handle(
+    const outcome = await routeToCalendar(
+      harness,
       buildJob(tenantId, 'am I free to ask you something?'),
     );
 
@@ -152,16 +141,6 @@ describe('Calendar create + conflict detection (integration)', () => {
     expect(harness.telegram.sent).toEqual([]);
   });
 
-  it('skips without an LLM call when the pre-filter finds nothing calendar-ish', async () => {
-    const outcome = await harness.agent.handle(
-      buildJob(tenantId, 'write me a python script to parse csv'),
-    );
-
-    expect(outcome).toEqual({ status: 'skipped', reason: 'prefiltered' });
-    expect(harness.classifier.callCount).toBe(0);
-    expect(harness.telegram.sent).toEqual([]);
-  });
-
   it('reports a rate limit as retryable by rethrowing', async () => {
     // Rate limits are transient, so the job should go back through BullMQ's
     // backoff rather than being swallowed.
@@ -169,7 +148,7 @@ describe('Calendar create + conflict detection (integration)', () => {
     harness.calendar.failNextWith('rate_limited');
 
     await expect(
-      harness.agent.handle(buildJob(tenantId, 'dentist tomorrow at 9')),
+      routeToCalendar(harness, buildJob(tenantId, 'dentist tomorrow at 9')),
     ).rejects.toMatchObject({ kind: 'rate_limited' });
   });
 });

@@ -1,22 +1,19 @@
 import { Injectable, Logger } from '@nestjs/common';
 import { Job } from 'bullmq';
 import { Prisma } from '@prisma/client';
-import { CalendarAgentService } from '../agents/calendar/calendar-agent.service';
-import { RagAgentService } from '../agents/rag/rag-agent.service';
 import {
   TelegramMessageJob,
-  attachmentOf,
   telegramMessageJobSchema,
 } from '../common/contracts/telegram-message.job';
+import { RouterService } from '../router/router.service';
 import { PrismaService } from '../prisma/prisma.service';
 
 /**
- * Consumes queued Telegram messages and dispatches them to the calendar agent.
+ * Consumes queued Telegram messages and hands each to the router.
  *
- * There is no general router yet — every message goes to the one agent that
- * exists, which classifies it and ignores anything non-calendar. A later phase
- * replaces this single call with routing across agents; the validation and
- * marker scaffolding around it stays.
+ * The processor knows nothing about agents since Phase 4a — RouterService is
+ * the single entry point that classifies once and dispatches. What stays here
+ * is the contract validation and the processed marker.
  */
 @Injectable()
 export class TelegramMessageProcessor {
@@ -24,45 +21,8 @@ export class TelegramMessageProcessor {
 
   constructor(
     private readonly prisma: PrismaService,
-    private readonly calendarAgent: CalendarAgentService,
-    private readonly ragAgent: RagAgentService,
+    private readonly router: RouterService,
   ) {}
-
-  /**
-   * Offers the message to each agent in turn until one claims it.
-   *
-   * This is NOT the intent router — it is the honest interim stand-in for one.
-   * Each agent classifies independently and returns `skipped` when the message
-   * is not its business, so ordering only decides who gets first refusal.
-   *
-   * An attachment goes straight to RAG: the calendar agent has nothing to do
-   * with a PDF, and its pre-filter would spend a classification deciding that.
-   *
-   * The real router replaces this with a single up-front classification, which
-   * is what stops the cost growing linearly with the number of agents.
-   */
-  private async dispatch(payload: TelegramMessageJob): Promise<void> {
-    if (attachmentOf(payload)) {
-      const outcome = await this.ragAgent.handle(payload);
-      this.logger.log(
-        `RAG agent handled attachment for message ${payload.messageId}: ${outcome.status}`,
-      );
-      return;
-    }
-
-    const calendar = await this.calendarAgent.handle(payload);
-    if (calendar.status !== 'skipped') {
-      this.logger.log(
-        `Calendar agent handled message ${payload.messageId}: ${calendar.status}`,
-      );
-      return;
-    }
-
-    const rag = await this.ragAgent.handle(payload);
-    this.logger.log(
-      `RAG agent outcome for message ${payload.messageId}: ${rag.status}`,
-    );
-  }
 
   async process(job: Job): Promise<void> {
     // Re-validate at the consumer boundary. The producer is trusted today, but
@@ -99,7 +59,10 @@ export class TelegramMessageProcessor {
     // rate-limited call never executed — so a retry cannot duplicate an event.
     // Every other agent failure returns an outcome instead of throwing, so it
     // never triggers a BullMQ retry in the first place.
-    await this.dispatch(payload);
+    const outcome = await this.router.handle(payload);
+    this.logger.log(
+      `Router outcome for message ${payload.messageId}: ${outcome.status}`,
+    );
 
     try {
       await this.prisma.processedMessage.create({

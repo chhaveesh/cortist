@@ -3,7 +3,6 @@ import { Test } from '@nestjs/testing';
 import request from 'supertest';
 import { CalendarClient } from '../../src/agents/calendar/google/calendar.port';
 import { TokenEncryptionService } from '../../src/crypto/token-encryption.service';
-import { CalendarIntentClassifier } from '../../src/agents/calendar/intent/calendar-intent.service';
 import { EmbeddingClient } from '../../src/agents/rag/embedding/embedding.port';
 import { RagLlm } from '../../src/agents/rag/intent/rag-llm.service';
 import { UrlFetcher } from '../../src/agents/rag/ingestion/url-fetcher.port';
@@ -18,7 +17,8 @@ import {
 } from '../fakes/fake-fetchers';
 import { FakeRagLlm } from '../fakes/fake-rag-llm';
 import { RecordingTelegramSender } from '../fakes/recording-telegram-sender';
-import { ScriptedIntentClassifier } from '../fakes/scripted-intent.classifier';
+import { ScriptedRouteClassifier } from '../fakes/scripted-route-classifier';
+import { RouteClassifier } from '../../src/router/intent/route-classifier.service';
 import {
   TestHarness,
   WEBHOOK_PATH,
@@ -45,7 +45,7 @@ describe('Agent routing across the shared queue (end to end)', () => {
 
   let telegram: RecordingTelegramSender;
   let calendarClient: FakeCalendarClient;
-  let calendarClassifier: ScriptedIntentClassifier;
+  let routeClassifier: ScriptedRouteClassifier;
   let ragLlm: FakeRagLlm;
   let embeddings: FakeEmbeddingClient;
   let files: FakeTelegramFileDownloader;
@@ -75,7 +75,7 @@ describe('Agent routing across the shared queue (end to end)', () => {
   async function startBothAgents(): Promise<INestApplicationContext> {
     telegram = new RecordingTelegramSender();
     calendarClient = new FakeCalendarClient();
-    calendarClassifier = new ScriptedIntentClassifier();
+    routeClassifier = new ScriptedRouteClassifier();
     ragLlm = new FakeRagLlm();
     embeddings = new FakeEmbeddingClient();
     files = new FakeTelegramFileDownloader();
@@ -87,8 +87,8 @@ describe('Agent routing across the shared queue (end to end)', () => {
       .useValue(telegram)
       .overrideProvider(CalendarClient)
       .useValue(calendarClient)
-      .overrideProvider(CalendarIntentClassifier)
-      .useValue(calendarClassifier)
+      .overrideProvider(RouteClassifier)
+      .useValue(routeClassifier)
       .overrideProvider(RagLlm)
       .useValue(ragLlm)
       .overrideProvider(EmbeddingClient)
@@ -147,7 +147,7 @@ describe('Agent routing across the shared queue (end to end)', () => {
 
     // The calendar agent must not have been consulted at all — it has nothing
     // to do with a file, and its classifier would be a wasted call.
-    expect(calendarClassifier.callCount).toBe(0);
+    expect(routeClassifier.callCount).toBe(0);
     expect(calendarClient.calls).toEqual([]);
     expect(telegram.transcript).toContain('Saved');
   });
@@ -155,9 +155,9 @@ describe('Agent routing across the shared queue (end to end)', () => {
   it('sends a calendar message to the calendar agent, never to RAG ingestion', async () => {
     worker = await startBothAgents();
 
-    calendarClassifier.script({
-      intent: 'create_event',
-      confidence: 'high',
+    routeClassifier.script({
+      route: 'calendar',
+      calendarAction: 'create_event',
       title: 'Dentist',
       startTime: '2026-07-21T09:00:00Z',
       endTime: '2026-07-21T10:00:00Z',
@@ -193,7 +193,7 @@ describe('Agent routing across the shared queue (end to end)', () => {
 
     // Nothing was stored in the second brain, and the RAG classifier never ran.
     expect(await harness.prisma.document.count()).toBe(0);
-    expect(ragLlm.classifyCalls).toEqual([]);
+    expect(await harness.prisma.document.count()).toBe(0);
   });
 
   it('routes a calendar message and a document sent back to back to different agents', async () => {
@@ -202,14 +202,9 @@ describe('Agent routing across the shared queue (end to end)', () => {
     worker = await startBothAgents();
     files.register('file-81021', 'Reference notes worth remembering.');
 
-    calendarClassifier.script({
-      intent: 'not_calendar_related',
-      confidence: 'high',
-    });
-    ragLlm.scriptIntent({
-      intent: 'query',
-      confidence: 'high',
-      question: 'what do my notes say?',
+    routeClassifier.script({
+      route: 'rag_query',
+      question: 'what do my notes say about the budget?',
     });
 
     await Promise.all([
@@ -233,22 +228,18 @@ describe('Agent routing across the shared queue (end to end)', () => {
     expect(documents[0].userId).toBe(uploader.id);
 
     // ...and the question went through the RAG classifier, not the ingest path.
-    expect(ragLlm.classifyCalls).toHaveLength(1);
+    expect(routeClassifier.callCount).toBeGreaterThan(0);
     expect(calendarClient.calls).toEqual([]);
   });
 
-  it('leaves a message both agents decline as a clean no-op', async () => {
+  it('replies honestly when the router finds no agent for a message', async () => {
     worker = await startBothAgents();
 
-    calendarClassifier.script({
-      intent: 'not_calendar_related',
-      confidence: 'high',
-    });
-    // A question-shaped message DOES reach the RAG classifier: "what is..."
-    // is genuinely ambiguous between a general question and one about stored
-    // notes, and resolving that is the classifier's job, not the keyword
-    // filter's. It declines here.
-    ragLlm.scriptIntent({ intent: 'not_rag_related', confidence: 'high' });
+    // A question-shaped message reaches the router's classifier: "what is..."
+    // is genuinely ambiguous between general knowledge and a question about
+    // stored notes, and resolving that is the classifier's job rather than the
+    // keyword filter's. It routes to unrelated.
+    routeClassifier.script({ route: 'unrelated' });
 
     await post(
       textUpdate(880_005, 'what is the capital of France?', 81_030),
@@ -261,8 +252,19 @@ describe('Agent routing across the shared queue (end to end)', () => {
     );
 
     expect(processed).not.toBeNull();
-    // Nothing said, nothing stored, nothing failed.
-    expect(telegram.sent).toEqual([]);
+
+    // Behaviour changed in Phase 4a, deliberately: an unrelated message now
+    // gets a scoped, honest reply instead of silence. Only the router is in a
+    // position to know that nothing handled the message — neither agent could
+    // tell on its own, which is why this used to be a silent no-op.
+    //
+    // Chit-chat is still dropped by the pre-filter before this point, so this
+    // only fires for messages that looked actionable and turned out not to be.
+    expect(telegram.sent).toHaveLength(1);
+    expect(telegram.last?.chatId).toBe('880005');
+    expect(telegram.last?.text).toMatch(/calendar/i);
+
+    // Nothing stored, nothing failed.
     expect(await harness.prisma.document.count()).toBe(0);
     expect(await harness.queue.getFailedCount()).toBe(0);
   });

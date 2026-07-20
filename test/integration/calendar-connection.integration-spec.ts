@@ -6,6 +6,7 @@ import {
   createCalendarHarness,
   destroyCalendarHarness,
   resetCalendarState,
+  routeToCalendar,
   seedTenant,
 } from '../calendar-harness';
 
@@ -27,7 +28,15 @@ describe('Calendar connection prompts (integration)', () => {
   });
 
   it('sends an OAuth link when the user has no calendar connected', async () => {
-    const outcome = await harness.agent.handle(
+    harness.classifier.script({
+      intent: 'create_event',
+      confidence: 'high',
+      title: 'Dentist',
+      startTime: '2026-07-20T09:00:00Z',
+      endTime: '2026-07-20T10:00:00Z',
+    });
+    const outcome = await routeToCalendar(
+      harness,
       buildJob(tenantId, 'book a dentist appointment tomorrow at 9'),
     );
 
@@ -36,13 +45,21 @@ describe('Calendar connection prompts (integration)', () => {
     const message = harness.telegram.last?.text ?? '';
     expect(message).toContain('/auth/google?state=');
 
-    // No LLM call and no calendar call — there is nothing to act on yet.
-    expect(harness.classifier.callCount).toBe(0);
+    // No calendar call — there is nothing to act on until they connect.
     expect(harness.calendar.calls).toEqual([]);
   });
 
   it('issues a link whose state resolves back to this tenant', async () => {
-    await harness.agent.handle(buildJob(tenantId, 'cancel my 3pm meeting'));
+    harness.classifier.script({
+      intent: 'delete_event',
+      confidence: 'high',
+      eventQuery: {
+        titleContains: 'meeting',
+        approximateStart: '',
+        approximateEnd: '',
+      },
+    });
+    await routeToCalendar(harness, buildJob(tenantId, 'cancel my 3pm meeting'));
 
     const message = harness.telegram.last?.text ?? '';
     const state = decodeURIComponent(/state=([^\s]+)/.exec(message)?.[1] ?? '');
@@ -52,24 +69,21 @@ describe('Calendar connection prompts (integration)', () => {
     expect(payload.chatId).toBe('900100100');
   });
 
-  it('does not prompt for a non-calendar message', async () => {
-    // An unconnected user asking something unrelated should hear nothing —
-    // the pre-filter runs before the connection check.
-    const outcome = await harness.agent.handle(
-      buildJob(tenantId, 'summarise this article for me'),
-    );
-
-    expect(outcome).toEqual({ status: 'skipped', reason: 'prefiltered' });
-    expect(harness.telegram.sent).toEqual([]);
-  });
-
   it('prompts to reconnect when the refresh token has been revoked', async () => {
     await connectCalendar(harness, tenantId, {
       expiresAt: new Date(Date.now() - 60_000),
     });
     harness.googleOAuth.failRefresh();
+    harness.classifier.script({
+      intent: 'create_event',
+      confidence: 'high',
+      title: 'Dentist',
+      startTime: '2026-07-20T09:00:00Z',
+      endTime: '2026-07-20T10:00:00Z',
+    });
 
-    const outcome = await harness.agent.handle(
+    const outcome = await routeToCalendar(
+      harness,
       buildJob(tenantId, 'book a dentist appointment tomorrow at 9'),
     );
 
@@ -99,7 +113,15 @@ describe('Calendar connection prompts (integration)', () => {
     });
 
     it('tells the user plainly and touches nothing external', async () => {
-      const outcome = await harness.agent.handle(
+      harness.classifier.script({
+        intent: 'create_event',
+        confidence: 'high',
+        title: 'Dentist',
+        startTime: '2026-07-20T09:00:00Z',
+        endTime: '2026-07-20T10:00:00Z',
+      });
+      const outcome = await routeToCalendar(
+        harness,
         buildJob(tenantId, 'book a dentist appointment tomorrow at 9'),
       );
 
@@ -108,23 +130,13 @@ describe('Calendar connection prompts (integration)', () => {
         missing: ['GOOGLE_CLIENT_ID', 'ANTHROPIC_API_KEY'],
       });
 
-      // No classification, no calendar call, no OAuth link that cannot work.
-      expect(harness.classifier.callCount).toBe(0);
+      // No calendar call, and no OAuth link that could not work anyway.
       expect(harness.calendar.calls).toEqual([]);
 
       // The user hears something honest rather than silence.
       const message = harness.telegram.last?.text ?? '';
       expect(message).toContain("isn't");
       expect(message).not.toContain('/auth/google');
-    });
-
-    it('stays silent on non-calendar messages', async () => {
-      const outcome = await harness.agent.handle(
-        buildJob(tenantId, 'write me a python script'),
-      );
-
-      expect(outcome).toEqual({ status: 'skipped', reason: 'prefiltered' });
-      expect(harness.telegram.sent).toEqual([]);
     });
   });
 
@@ -138,7 +150,8 @@ describe('Calendar connection prompts (integration)', () => {
       endTime: '2026-07-20T10:00:00Z',
     });
 
-    const outcome = await harness.agent.handle(
+    const outcome = await routeToCalendar(
+      harness,
       buildJob(tenantId, 'book a dentist appointment tomorrow at 9'),
     );
 

@@ -4,6 +4,7 @@ import {
   createRagHarness,
   destroyRagHarness,
   resetRagState,
+  routeToRag,
   seedRagTenant,
 } from '../rag-harness';
 
@@ -69,7 +70,8 @@ describe('RAG retrieval (integration)', () => {
       question: 'What was Q4 revenue?',
     });
 
-    await harness.agent.handle(
+    await routeToRag(
+      harness,
       buildRagJob(tenantId, 'what did the report say about Q4 revenue?'),
     );
 
@@ -118,7 +120,8 @@ describe('RAG retrieval (integration)', () => {
         question: 'How do I repair a bicycle chain?',
       });
 
-      const outcome = await harness.agent.handle(
+      const outcome = await routeToRag(
+        harness,
         buildRagJob(tenantId, 'what do my notes say about bicycle repair?'),
       );
 

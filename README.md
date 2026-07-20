@@ -10,6 +10,9 @@ A Telegram-based AI personal assistant.
 - **Phase 3** — a second, independent sub-agent: a RAG "second brain" that
   ingests PDFs, pasted text, and web pages, and answers questions about them
   with citations.
+- **Phase 4a** — the intent router: one classification per message, then clean
+  dispatch to exactly one agent, with a clarifying question instead of a guess
+  when a message is genuinely ambiguous.
 
 Task and email agents arrive in later phases and plug into the same queue
 contract described below.
@@ -141,10 +144,60 @@ POST the same payload again and the response becomes
    Google Calendar API (calendar.events)  +  pgvector (local)
 ```
 
-**There is still no intent router.** Each agent classifies independently and
-returns `skipped` when a message is not its business, so the worker offers the
-message to each in turn. That is honest but O(agents) in cost, which is exactly
-why the router is the next phase.
+### The router
+
+Every message is classified **exactly once**, by the router, and then handed to
+one agent. Before Phase 4a each agent ran its own classifier and decided for
+itself whether a message was its business — up to two LLM calls, and no single
+place that knew where a message went.
+
+The order the router works in is load-bearing:
+
+1. **An outstanding routing question** — the user is answering *us*.
+2. **An agent awaiting a follow-up** — the user is answering *it*. This must
+   come before classification: "yes" to a delete confirmation classifies as
+   `unrelated`, which would strand the pending action and silently break every
+   destructive-action confirmation from Phase 2.
+3. **Attachments**, which need no classification — a PDF upload is unambiguous.
+4. **The keyword pre-filter**, so chit-chat costs nothing.
+5. **One classification**, then dispatch.
+
+The single call does routing *and* extraction, so a calendar message arrives at
+the calendar agent with its title and times already parsed. The agents no longer
+classify at all.
+
+### Ambiguity
+
+Some messages genuinely admit two readings. *"Remind me about the Q3 report"* is
+either a calendar reminder or a lookup in your saved documents, and picking one
+silently is how an assistant does the wrong thing confidently.
+
+The classifier reports a **confidence** and its **runner-up**:
+
+> **Ambiguous ⟺ confidence is not `high` AND a different alternative exists.**
+
+Asking for the runner-up rather than a bare score is what lets the question name
+both options — *"Did you mean something with your calendar, or a question about
+your saved documents?"* — instead of a vague "what did you mean?".
+
+Both halves of the rule matter. Low confidence with *no* alternative is not
+ambiguity: there is no second option to offer, so it routes anyway and the
+agent's own clarification handles an underspecified request. A named runner-up
+at *high* confidence means the model saw a second reading and dismissed it,
+which is the judgement we want it to make rather than escalating.
+
+**One question, then it stops.** If the answer is still unclear the router says
+so honestly rather than asking again — a second attempt costs the user a third
+message and rarely lands when the first did not. Unanswered questions expire
+after `CLARIFICATION_TTL_SECONDS` (3 min), shorter than a pending calendar
+confirmation because "did you mean X or Y?" stops making sense once the user has
+moved on.
+
+Over-triggering is a real failure mode, not a safe default, so
+`test/unit/router-ambiguity.spec.ts` pins **both** directions: genuinely
+dual-plausible phrasings must ask, and messages that merely *mention* both
+domains — *"create a calendar event to review the Q3 report tomorrow at 3pm"* —
+must not.
 
 **Why the pending-confirmation check runs first.** A user replying "yes"
 sends an ordinary Telegram message. Classified normally it comes back
@@ -220,6 +273,16 @@ npm run test:e2e:only    # end-to-end tier only
 ```
 
 ### Checking what the model actually does
+
+```bash
+npm run eval:router              # routing fixtures, against the real API
+npm run eval:router -- ambiguous # just the ambiguous ones
+```
+
+Prints the model's own **reasoning** for each fixture, not only the label — a
+right answer for a wrong reason is worth catching before it becomes a wrong
+answer. It also flags any fixture the pre-filter would drop before the model
+ever saw it.
 
 The suite uses a scripted classifier, so the *model's* judgement is never
 exercised by CI. That matters for one thing in particular: whether it asks
@@ -649,6 +712,10 @@ src/
   crypto/                    AES-256-GCM token encryption
   oauth/                     signed state, Google client, token store + refresh
   auth/                      GET /auth/google, /auth/google/callback  [gateway]
+  router/                    ← the single entry point
+    router.service.ts          classify once, then dispatch
+    intent/                    unified route+extract schema, classifier, filter
+    clarification/             pending question store + reply parser
   agents/rag/                ← the second brain, self-contained
     rag-agent.service.ts       orchestrator; single entry point `handle(job)`
     embedding/                 EmbeddingClient port + local transformers.js impl

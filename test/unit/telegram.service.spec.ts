@@ -25,6 +25,7 @@ function fakeUser(overrides: Partial<User> = {}): User {
     id: TENANT_ID,
     telegramUserId: 123n,
     telegramChatId: 456n,
+    timeZone: null,
     createdAt: new Date('2026-01-01T00:00:00.000Z'),
     ...overrides,
   };

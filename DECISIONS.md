@@ -891,17 +891,161 @@ matched the sentence about the engineering team, not the revenue sentence.
 
 ---
 
-## Still deferred after Phase 3
+# Phase 4a — Intent router
+
+## 46. The ambiguity threshold
+
+**Ambiguous ⟺ `confidence !== 'high'` AND `alternative !== 'none'` AND
+`alternative !== route`.**
+
+The classifier returns a confidence *and its runner-up*. Asking for the runner-up
+rather than a bare numeric score is the substantive choice here: a score tells
+you *that* the model hesitated, the runner-up tells you *between what* — which is
+what lets the clarifying question name both options instead of asking a vague
+"what did you mean?". A question the user can answer in two words beats one that
+restarts the conversation.
+
+Both halves of the conjunction earn their place:
+
+- **Low confidence with no alternative is not ambiguity.** There is no second
+  option to offer, so "did you mean A or…?" is nonsense. It routes anyway and
+  the agent's own clarification handles a merely underspecified request.
+- **A named alternative at high confidence is not ambiguity either.** The model
+  saw a second reading and dismissed it — exactly the judgement we want it
+  making rather than escalating to the user.
+
+This is a UX dial, not a correctness property: loosening it interrupts users more
+often, tightening it misroutes more often. **Over-triggering is a failure mode in
+its own right** — a user asked "did you mean X or Y?" about a request they stated
+perfectly clearly learns the assistant is not listening. So
+`test/unit/router-ambiguity.spec.ts` pins both directions, and the threshold
+table is written out exhaustively there so the policy is legible in one place
+rather than inferred from an implementation.
+
+What those tests cannot check is whether the *model* assigns sensible confidence
+and alternatives to real phrasings. That is its judgement, and no mock reaches
+it — `npm run eval:router` is where the expectation meets reality, and it prints
+the model's own reasoning rather than just its label.
+
+## 47. One call that routes AND extracts
+
+The router's single classification returns the route *and* the chosen agent's
+fields, so a calendar message arrives with its title and times already parsed.
+
+The alternative — route first, let the agent extract — keeps the router thin but
+costs two LLM round trips for every routed message, which would have meant the
+"classify once" phase did not actually reduce anything. The cost of this choice
+is equally real and worth stating plainly: **the router's schema now contains
+every agent's fields, so adding an agent widens it.**
+
+Two things keep that from rotting. The schema *imports* each agent's zod schema
+and narrowing function rather than restating them, so extraction rules live in
+one place and the router cannot drift from them — a change to the calendar
+agent's rules applies to the router automatically. And `narrowRoute` delegates,
+so the calendar agent's downgrade-an-incomplete-request-to-a-question behaviour
+applies identically whether the fields came from the router or not.
+
+## 48. The timezone had to move — and that was an improvement
+
+Extraction resolves "tomorrow at 3pm", which needs the user's calendar
+timezone. The router has no calendar access and should not gain any, so a
+router-extracts design initially looked like it would force Google credentials
+into the router.
+
+It did not, because the previous arrangement was itself wasteful: the calendar
+agent fetched the timezone **on every single message** via an extra
+`events.list` call whose only purpose was to read one field. Caching it on
+`users.time_zone` removes that round trip *and* gives the router what it needs
+from the database.
+
+The cache is written as a side effect of a call the calendar agent was already
+making, so keeping it fresh costs nothing, and a failed write is swallowed —
+a stale timezone must not fail a user's request. A tenant who has never
+connected a calendar falls back to `DEFAULT_TIMEZONE`.
+
+## 49. Agents keep their own conversations
+
+The router asks each agent `claimsFollowUp(tenantId)` before classifying, and
+dispatches straight there when the answer is yes.
+
+Moving pending state into the router was the alternative, and would have been
+more centralised. It was rejected because it means rewriting Phase 2's
+`PendingActionService` and its tests to fix something that is not broken — the
+agent owning the conversation it started is the simpler model, and the router
+only needs to know *whether* to skip classification, not why.
+
+**This ordering is the single most important line in the router.** A user
+replying "yes" to a delete confirmation sends an ordinary message; classified
+normally it comes back `unrelated`, gets the polite fallback, and the pending
+action is stranded — silently breaking every destructive-action confirmation.
+There is a test asserting the classifier is not called on that path.
+
+**One subtlety preserved from §25.** An *unclear* reply to a pending
+confirmation is not necessarily a bad answer — it may be the user changing their
+mind ("actually, cancel my lunch instead"), which should supersede rather than be
+met with "I need a yes or no". So `handleFollowUp` returns `unclear_reply`
+**without messaging**, and the router classifies to decide which it was. Getting
+this wrong would have been an invisible regression: the tests would pass and the
+experience would quietly get worse.
+
+## 50. What the refactor removed, and a bug it exposed
+
+`CalendarIntentClassifier` and its Anthropic implementation are deleted;
+`RagLlm.classify` and its prompt are gone. Both agents' pre-filters are gone from
+the agents, merged into one filter in front of the router.
+
+Deleting rather than leaving unused mattered here: the classifier was still
+registered as a provider with nothing injecting it, which is exactly the state
+where a test passes while dead code sits in the module. `RagLlm` survives for
+summarisation and answering; only `classify` went.
+
+**The merged filter exposed a real recall bug.** Composed as the union of both
+agents' filters — deliberately, so each keeps its own tuning and regression
+tests, and the union is strictly more permissive than either alone — it revealed
+that neither matched some obvious requests:
+
+- The calendar filter matched the noun `reminder` but **not the verb `remind`**,
+  so "remind me about the dentist" was dropped entirely. Not ambiguous. Just
+  gone.
+- The RAG filter required `the report` with nothing between, so "the Q3 report"
+  and "the quarterly report" both failed.
+
+Together those dropped `"remind me about the Q3 report"` — the canonical
+ambiguous phrasing this phase exists to handle — before the router ever saw it.
+Both patterns are fixed and pinned by tests that assert the ambiguous fixtures
+reach the classifier at all, because ambiguity logic is worthless on a message
+that never arrives.
+
+## 51. An unrelated message now gets a reply
+
+Previously both agents skipped an out-of-scope message and it vanished. Only the
+router is in a position to know that *nothing* handled it — neither agent could
+tell alone — so it answers with what the assistant can actually do rather than
+with silence or a generic apology.
+
+Chit-chat is still dropped by the pre-filter before this point, so the reply only
+fires for messages that looked actionable and turned out not to be. An e2e test
+that asserted silence was updated to assert the reply: a genuine behaviour
+change, not a broken test.
+
+---
+
+## Still deferred after Phase 4a
 
 Recurring-event editing (the client expands instances via `singleEvents`, but
 editing a series is not modelled); attendee invitations and responses; free/busy
 negotiation beyond detect-and-report; multiple calendars per user (everything
-targets `primary`); a general multi-agent router; key rotation with
-re-encryption. The Phase 1 deferrals — rate limiting, a dead-letter queue with
-alerting, and structured JSON logging with trace correlation — all still stand.
+targets `primary`); key rotation with re-encryption. The Phase 1 deferrals —
+rate limiting, a dead-letter queue with alerting, and structured JSON logging
+with trace correlation — all still stand.
 
-Phase 3 adds: the intent router (§42); re-embedding when the model changes (the
-vector dimension is fixed by migration, so a model swap needs a new migration
-*and* a backfill); OCR for scanned PDFs; document deletion and listing over
-Telegram; reranking; and tuning chunk size, overlap, and the similarity
-threshold against measured retrieval quality rather than judgement.
+Phase 4a adds: compound multi-step instructions ("check my calendar and save
+this doc"), which is Phase 4b and the reason single-intent routing had to be
+solid first; and per-agent routing metrics, since there is now one place that
+knows where every message went.
+
+Phase 3 added: re-embedding when the model changes (the vector dimension is
+fixed by migration, so a model swap needs a new migration *and* a backfill);
+OCR for scanned PDFs; document deletion and listing over Telegram; reranking;
+and tuning chunk size, overlap, and the similarity threshold against measured
+retrieval quality rather than judgement.

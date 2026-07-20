@@ -24,7 +24,11 @@ const KEYWORD_PATTERNS: RegExp[] = [
   /\bcall(s)?\b/i,
   /\bschedule(s|d)?\b/i,
   /\bbooking(s)?\b/i,
-  /\breminder(s)?\b/i,
+  // The verb as well as the noun. Matching only "reminder" dropped
+  // "remind me about the dentist" entirely — an unambiguous calendar request
+  // that never reached the classifier at all. Found in Phase 4a, where this
+  // filter became the single gate in front of the router.
+  /\bremind(er|ers|s|ed)?\b/i,
   /\bsync\b/i,
   /\bstandup\b/i,
   /\binterview(s)?\b/i,

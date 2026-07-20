@@ -2,13 +2,13 @@ import { INestApplicationContext } from '@nestjs/common';
 import { Test } from '@nestjs/testing';
 import request from 'supertest';
 import { CalendarClient } from '../../src/agents/calendar/google/calendar.port';
-import { CalendarIntentClassifier } from '../../src/agents/calendar/intent/calendar-intent.service';
 import { TelegramSenderService } from '../../src/telegram/outbound/telegram-sender.service';
 import { OAuthStateService } from '../../src/oauth/oauth-state.service';
 import { WorkerAppModule } from '../../src/worker.module.root';
 import { FakeCalendarClient } from '../fakes/fake-calendar.client';
 import { RecordingTelegramSender } from '../fakes/recording-telegram-sender';
-import { ScriptedIntentClassifier } from '../fakes/scripted-intent.classifier';
+import { ScriptedRouteClassifier } from '../fakes/scripted-route-classifier';
+import { RouteClassifier } from '../../src/router/intent/route-classifier.service';
 import {
   TestHarness,
   WEBHOOK_PATH,
@@ -34,7 +34,7 @@ describe('Telegram -> queue -> worker -> calendar agent -> reply (end to end)', 
   let harness: TestHarness;
   let worker: INestApplicationContext | undefined;
   let telegram: RecordingTelegramSender;
-  let classifier: ScriptedIntentClassifier;
+  let classifier: ScriptedRouteClassifier;
   let calendar: FakeCalendarClient;
 
   beforeAll(async () => {
@@ -62,7 +62,7 @@ describe('Telegram -> queue -> worker -> calendar agent -> reply (end to end)', 
    */
   async function startAgentWorker() {
     telegram = new RecordingTelegramSender();
-    classifier = new ScriptedIntentClassifier();
+    classifier = new ScriptedRouteClassifier();
     calendar = new FakeCalendarClient();
 
     const moduleRef = await Test.createTestingModule({
@@ -70,7 +70,7 @@ describe('Telegram -> queue -> worker -> calendar agent -> reply (end to end)', 
     })
       .overrideProvider(TelegramSenderService)
       .useValue(telegram)
-      .overrideProvider(CalendarIntentClassifier)
+      .overrideProvider(RouteClassifier)
       .useValue(classifier)
       .overrideProvider(CalendarClient)
       .useValue(calendar)
@@ -105,6 +105,13 @@ describe('Telegram -> queue -> worker -> calendar agent -> reply (end to end)', 
     const chatId = 606_010_101;
 
     worker = await startAgentWorker();
+    classifier.script({
+      route: 'calendar',
+      calendarAction: 'create_event',
+      title: 'Dentist',
+      startTime: '2026-07-21T09:00:00Z',
+      endTime: '2026-07-21T10:00:00Z',
+    });
 
     // No calendar connected, so the agent should answer with an OAuth link.
     await post(
@@ -138,6 +145,24 @@ describe('Telegram -> queue -> worker -> calendar agent -> reply (end to end)', 
     const bob = 606_020_202;
 
     worker = await startAgentWorker();
+    classifier.script(
+      {
+        route: 'calendar',
+        calendarAction: 'delete_event',
+        eventQuery: {
+          titleContains: 'meeting',
+          approximateStart: '',
+          approximateEnd: '',
+        },
+      },
+      {
+        route: 'calendar',
+        calendarAction: 'create_event',
+        title: 'Lunch',
+        startTime: '2026-07-21T12:00:00Z',
+        endTime: '2026-07-21T13:00:00Z',
+      },
+    );
 
     await Promise.all([
       post(update(alice, 'cancel my 3pm meeting', 70_010)).expect(200),

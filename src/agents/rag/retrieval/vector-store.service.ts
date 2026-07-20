@@ -113,6 +113,22 @@ export class VectorStoreService {
       );
     }
 
+    // Coerced and validated rather than trusted.
+    //
+    // Prisma binds a raw-query parameter using its JS type, so a `limit` that
+    // arrived as a string — from an env var read without coercion, say —
+    // reaches Postgres as text and the query dies with
+    // "argument of LIMIT must be type bigint, not type text". That error names
+    // neither the parameter nor the caller. The config layer coerces this
+    // today, but this method is public and the failure is too obscure to leave
+    // to convention.
+    const safeLimit = Number(limit);
+    if (!Number.isInteger(safeLimit) || safeLimit < 1) {
+      throw new Error(
+        `Search limit must be a positive integer, got ${JSON.stringify(limit)}`,
+      );
+    }
+
     // Iterative scan makes a filtered HNSW search keep looking until it has
     // enough rows that actually match the filter. Without it, the index scan
     // finds K global nearest neighbours and *then* drops other tenants' rows —
@@ -147,7 +163,7 @@ export class VectorStoreService {
       JOIN documents d ON d.id = c.document_id
       WHERE c.user_id = ${userId}::uuid
       ORDER BY c.embedding <=> ${this.toVector(embedding)}::vector
-      LIMIT ${limit}
+      LIMIT ${safeLimit}
     `;
 
     return rows.map((row) => ({

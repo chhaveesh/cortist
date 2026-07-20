@@ -206,6 +206,43 @@ describe('RAG retrieval (integration)', () => {
     });
   });
 
+  describe('search limit validation', () => {
+    /**
+     * Prisma binds a raw-query parameter by its JS type, so a string `limit`
+     * reaches Postgres as text and the query dies with "argument of LIMIT must
+     * be type bigint, not type text" — an error naming neither the parameter
+     * nor the caller. Found by driving the service without the config layer's
+     * zod coercion in front of it.
+     */
+    it('accepts a numeric string rather than failing at the database', async () => {
+      await storeReport();
+      const vector = await harness.embeddings.embedOne(
+        'What was Q4 revenue?',
+        'query',
+      );
+
+      await expect(
+        harness.store.searchSimilar(tenantId, vector, '3' as unknown as number),
+      ).resolves.toBeInstanceOf(Array);
+    });
+
+    it.each([0, -1, 1.5, NaN, 'abc', null, undefined])(
+      'rejects an invalid limit (%s) with a clear message',
+      async (limit) => {
+        await storeReport();
+        const vector = await harness.embeddings.embedOne('q', 'query');
+
+        await expect(
+          harness.store.searchSimilar(
+            tenantId,
+            vector,
+            limit as unknown as number,
+          ),
+        ).rejects.toThrow(/limit must be a positive integer/i);
+      },
+    );
+  });
+
   it('deduplicates citations when several chunks share a document', async () => {
     const long = Array.from(
       { length: 30 },

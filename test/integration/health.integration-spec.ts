@@ -1,5 +1,6 @@
 import request from 'supertest';
 import { CalendarConfigService } from '../../src/config/calendar-config.service';
+import { LlmConfigService } from '../../src/config/llm-config.service';
 import { PrismaService } from '../../src/prisma/prisma.service';
 import { REDIS_CLIENT } from '../../src/redis/redis.module';
 import {
@@ -37,7 +38,49 @@ describe('GET /health (integration)', () => {
       postgres: 'connected',
       // .env.test supplies the full calendar credential set.
       calendar: 'configured',
+      router: 'configured',
     });
+  });
+
+  /**
+   * Routing degrades far more widely than the calendar does — since Phase 4a
+   * every actionable message is classified — so `/health` has to say so. It
+   * still does not affect the status code, for the same reason `calendar`
+   * does not: ingestion and queueing keep working, and messages are still
+   * accepted durably.
+   */
+  it('reports router configuration without affecting the status code', async () => {
+    const llmConfig = harness.app.get(LlmConfigService);
+    jest.spyOn(llmConfig, 'isConfigured', 'get').mockReturnValue(false);
+    jest
+      .spyOn(llmConfig, 'placeholderVars', 'get')
+      .mockReturnValue(['ANTHROPIC_API_KEY']);
+
+    const response = await get();
+
+    expect(response.status).toBe(200);
+    expect(response.body.status).toBe('ok');
+    expect(response.body.router).toBe('not_configured');
+    expect(response.body.routerPlaceholder).toEqual(['ANTHROPIC_API_KEY']);
+  });
+
+  /**
+   * The distinction that makes the report actionable: a variable you can see
+   * in your own .env must not be described as missing.
+   */
+  it('distinguishes a placeholder credential from an absent one', async () => {
+    const calendarConfig = harness.app.get(CalendarConfigService);
+    jest.spyOn(calendarConfig, 'isConfigured', 'get').mockReturnValue(false);
+    jest.spyOn(calendarConfig, 'missingVars', 'get').mockReturnValue([]);
+    jest
+      .spyOn(calendarConfig, 'placeholderVars', 'get')
+      .mockReturnValue(['GOOGLE_CLIENT_ID']);
+
+    const response = await get();
+
+    expect(response.body.calendar).toBe('not_configured');
+    expect(response.body.calendarMissing).toEqual([]);
+    expect(response.body.calendarPlaceholder).toEqual(['GOOGLE_CLIENT_ID']);
   });
 
   /**

@@ -1,7 +1,10 @@
 import { Controller, Get, HttpStatus, Inject, Res } from '@nestjs/common';
 import type { Response } from 'express';
 import Redis from 'ioredis';
+import { ConfigService } from '@nestjs/config';
 import { CalendarConfigService } from '../config/calendar-config.service';
+import { Env } from '../config/env.schema';
+import { LlmConfigService } from '../config/llm-config.service';
 import { PrismaService } from '../prisma/prisma.service';
 import { REDIS_CLIENT } from '../redis/redis.module';
 
@@ -20,6 +23,30 @@ export interface HealthResponse {
   calendar: 'configured' | 'not_configured';
   /** Names of the absent calendar variables. Present only when unconfigured. */
   calendarMissing?: string[];
+  /**
+   * Calendar variables that are set but still hold an `.env.example`
+   * placeholder. Reported separately from `calendarMissing` because "missing"
+   * sends you looking for a variable you can plainly see in your `.env`.
+   */
+  calendarPlaceholder?: string[];
+  /**
+   * Whether message routing can run at all. Since Phase 4a the router
+   * classifies every actionable message, so this degrades far more than the
+   * calendar does — but for the same reason as `calendar` above it is reported
+   * rather than made part of the 200/503 decision: ingestion and queueing are
+   * unaffected, and messages keep being accepted durably.
+   */
+  router: 'configured' | 'not_configured';
+  /** Why routing is unconfigured. Present only when it is. */
+  routerMissing?: string[];
+  routerPlaceholder?: string[];
+  /**
+   * Present only when TIMEZONE_OVERRIDE pins every user to one zone.
+   *
+   * Reported because it is invisible otherwise: times would simply be wrong for
+   * anyone outside that zone, with nothing anywhere saying why.
+   */
+  timeZoneOverride?: string;
   /** Present only when degraded: which dependencies failed, and why. */
   failures?: Array<{ dependency: string; error: string }>;
 }
@@ -37,7 +64,13 @@ export class HealthController {
     private readonly prisma: PrismaService,
     @Inject(REDIS_CLIENT) private readonly redis: Redis,
     private readonly calendarConfig: CalendarConfigService,
-  ) {}
+    private readonly llmConfig: LlmConfigService,
+    config: ConfigService<Env, true>,
+  ) {
+    this.timeZoneOverride = config.get('TIMEZONE_OVERRIDE', { infer: true });
+  }
+
+  private readonly timeZoneOverride?: string;
 
   @Get()
   async check(@Res() res: Response): Promise<void> {
@@ -56,6 +89,7 @@ export class HealthController {
     const healthy = failures.length === 0;
 
     const calendarConfigured = this.calendarConfig.isConfigured;
+    const routerConfigured = this.llmConfig.isConfigured;
 
     const body: HealthResponse = {
       status: healthy ? 'ok' : 'error',
@@ -64,7 +98,20 @@ export class HealthController {
       calendar: calendarConfigured ? 'configured' : 'not_configured',
       ...(calendarConfigured
         ? {}
-        : { calendarMissing: this.calendarConfig.missingVars }),
+        : {
+            calendarMissing: this.calendarConfig.missingVars,
+            calendarPlaceholder: this.calendarConfig.placeholderVars,
+          }),
+      router: routerConfigured ? 'configured' : 'not_configured',
+      ...(this.timeZoneOverride
+        ? { timeZoneOverride: this.timeZoneOverride }
+        : {}),
+      ...(routerConfigured
+        ? {}
+        : {
+            routerMissing: this.llmConfig.missingVars,
+            routerPlaceholder: this.llmConfig.placeholderVars,
+          }),
       ...(healthy ? {} : { failures }),
     };
 

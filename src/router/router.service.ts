@@ -7,6 +7,8 @@ import {
   attachmentOf,
 } from '../common/contracts/telegram-message.job';
 import { Env } from '../config/env.schema';
+import { LlmConfigService } from '../config/llm-config.service';
+import { LlmRequestError, RETRY_WINDOW_SECONDS } from '../llm/llm-error';
 import { PrismaService } from '../prisma/prisma.service';
 import { TelegramSenderService } from '../telegram/outbound/telegram-sender.service';
 import { interpretClarification } from './clarification/clarification-reply';
@@ -26,7 +28,43 @@ export type RouterOutcome =
   | { status: 'clarification_resolved'; route: RouteName; agentStatus: string }
   | { status: 'gave_up' }
   | { status: 'unrelated' }
+  | { status: 'not_configured' }
+  | { status: 'rate_limited'; retryAfterSeconds?: number }
   | { status: 'skipped'; reason: 'prefiltered' };
+
+/**
+ * What the user is told when routing cannot run at all.
+ *
+ * Deliberately about *us*, not them: they asked a perfectly good question and
+ * the answer is that this deployment is missing a credential. Saying so beats
+ * both silence and a generic "something went wrong".
+ */
+const NOT_CONFIGURED_MESSAGE =
+  "I can't work out what to do with that right now — this assistant is " +
+  "missing some configuration on my side, so I can't understand messages " +
+  'until that is fixed. Nothing you sent has been lost.';
+
+/**
+ * Told to the user when the provider is rate limiting us for longer than the
+ * retry policy can wait out.
+ *
+ * Names a rough wait rather than apologising vaguely: "try again in a minute"
+ * is actionable, "something went wrong" is not.
+ */
+function rateLimitedMessage(retryAfterSeconds?: number): string {
+  const wait = retryAfterSeconds
+    ? `about ${Math.ceil(retryAfterSeconds)} seconds`
+    : 'a moment';
+  return (
+    `I'm being rate limited right now, so I couldn't read that one. ` +
+    `Try again in ${wait} — nothing you sent has been lost.`
+  );
+}
+
+/** Either a classification, or the outcome to report because it degraded. */
+type ClassifyResult =
+  | { ok: true; decision: RoutingDecision }
+  | { ok: false; outcome: RouterOutcome };
 
 /**
  * The single classification and dispatch point.
@@ -51,6 +89,7 @@ export type RouterOutcome =
 export class RouterService {
   private readonly logger = new Logger(RouterService.name);
   private readonly defaultTimeZone: string;
+  private readonly timeZoneOverride?: string;
 
   constructor(
     private readonly classifier: RouteClassifier,
@@ -59,9 +98,11 @@ export class RouterService {
     private readonly rag: RagAgentService,
     private readonly telegram: TelegramSenderService,
     private readonly prisma: PrismaService,
+    private readonly llmConfig: LlmConfigService,
     config: ConfigService<Env, true>,
   ) {
     this.defaultTimeZone = config.get('DEFAULT_TIMEZONE', { infer: true });
+    this.timeZoneOverride = config.get('TIMEZONE_OVERRIDE', { infer: true });
   }
 
   async handle(
@@ -116,13 +157,12 @@ export class RouterService {
     }
 
     // 5. Classify once.
-    const decision = await this.classifier.classify({
-      text: job.text,
-      timeZone: await this.timeZoneFor(job.tenantId),
-      now,
-    });
+    const result = await this.classifyOrDegrade(job, job.text, now);
+    if (!result.ok) {
+      return result.outcome;
+    }
 
-    return this.dispatch(job, decision, now);
+    return this.dispatch(job, result.decision, now);
   }
 
   // -------------------------------------------------------------------------
@@ -196,11 +236,14 @@ export class RouterService {
       };
     }
 
-    const decision = await this.classifier.classify({
-      text: job.text,
-      timeZone: await this.timeZoneFor(job.tenantId),
-      now,
-    });
+    const followUp = await this.classifyOrDegrade(job, job.text, now);
+    if (!followUp.ok) {
+      // The pending confirmation is deliberately left standing: we could not
+      // read this reply, so treating it as a supersede would silently cancel a
+      // destructive action the user is still waiting on. It expires on its own.
+      return followUp.outcome;
+    }
+    const decision = followUp.decision;
 
     if (decision.route === 'unrelated' || decision.route === 'ambiguous') {
       await this.calendar.askForClearConfirmation(job);
@@ -263,6 +306,14 @@ export class RouterService {
     job: TelegramMessageJob,
     now: Date,
   ): Promise<RouterOutcome> {
+    // Checked before the claim: consuming the pending question and then failing
+    // to act on it would lose it for good, where leaving it lets the user
+    // answer again once the deployment is fixed.
+    if (!this.llmConfig.isConfigured) {
+      await this.replyNotConfigured(job);
+      return { status: 'not_configured' };
+    }
+
     const claimed = await this.clarifications.claim(job.tenantId, now);
     if (!claimed) {
       // Expired or another handler won the race — treat as a fresh message.
@@ -303,11 +354,15 @@ export class RouterService {
     // Re-run the original message against the chosen route only. This is a
     // second LLM call, but it happens only on the ambiguous path — the common
     // case still costs exactly one.
-    const decision = await this.classifier.classify({
-      text: `${claimed.originalText}\n\n(The user has clarified this is ${describeRoute(chosen)}.)`,
-      timeZone: await this.timeZoneFor(job.tenantId),
+    const replayResult = await this.classifyOrDegrade(
+      job,
+      `${claimed.originalText}\n\n(The user has clarified this is ${describeRoute(chosen)}.)`,
       now,
-    });
+    );
+    if (!replayResult.ok) {
+      return replayResult.outcome;
+    }
+    const decision = replayResult.decision;
 
     // Replay against the ORIGINAL job so replies go to the right chat, but
     // carry the clarified text so the agent sees what was actually asked.
@@ -331,6 +386,99 @@ export class RouterService {
   // -------------------------------------------------------------------------
 
   /**
+   * Classifies, or degrades honestly when the model is not configured.
+   *
+   * Every classification in this service goes through here, which is the point:
+   * the check is easy to forget at a call site, and forgetting it restores the
+   * exact failure this exists to prevent — a 401 thrown into BullMQ, retried
+   * three times, dropped in the failed set, with the user told nothing.
+   *
+   * Returns null when it has already replied to the user. Callers turn that
+   * into `not_configured` rather than continuing.
+   *
+   * Note this covers *configuration*, not availability. A genuine outage or a
+   * rate limit still throws, and should: those are transient, and retrying is
+   * the right response. A missing credential is not transient, so retrying it
+   * only delays telling the user something they need to hear.
+   */
+  private async classifyOrDegrade(
+    job: TelegramMessageJob,
+    text: string,
+    now: Date,
+  ): Promise<ClassifyResult> {
+    if (!this.llmConfig.isConfigured) {
+      await this.replyNotConfigured(job);
+      return { ok: false, outcome: { status: 'not_configured' } };
+    }
+
+    try {
+      const decision = await this.classifier.classify({
+        text,
+        timeZone: await this.timeZoneFor(job.tenantId),
+        now,
+      });
+      return { ok: true, decision };
+    } catch (error) {
+      if (!(error instanceof LlmRequestError)) {
+        throw error;
+      }
+
+      if (error.retryable) {
+        // A short blip is exactly what the retry policy exists for, so rethrow
+        // and let BullMQ back off.
+        //
+        // But when the provider names a wait LONGER than the policy's whole
+        // window, retrying is theatre: observed live, a 429 saying "retry in
+        // 19.8s" burned all three attempts inside 6s and the user got silence.
+        // Better to say so immediately, while they are still looking at their
+        // phone, than to fail three times in private.
+        const waitsTooLong =
+          error.retryAfterSeconds !== undefined &&
+          error.retryAfterSeconds > RETRY_WINDOW_SECONDS;
+
+        if (!waitsTooLong) {
+          throw error;
+        }
+
+        this.logger.warn(
+          `Rate limited on message ${job.messageId}: provider asked for ${error.retryAfterSeconds}s, ` +
+            `longer than the ${RETRY_WINDOW_SECONDS}s retry window — telling the user instead of retrying.`,
+        );
+        await this.telegram.sendMessage(
+          job.chatId,
+          rateLimitedMessage(error.retryAfterSeconds),
+        );
+        return {
+          ok: false,
+          outcome: {
+            status: 'rate_limited',
+            retryAfterSeconds: error.retryAfterSeconds,
+          },
+        };
+      }
+
+      // A non-retryable one cannot succeed on attempt two. The credential is
+      // wrong, the balance is empty, or the model does not exist — none of
+      // which changes in the ~6s it takes to exhaust the attempts, during
+      // which the user is told nothing and then still nothing.
+      this.logger.error(
+        `Cannot route message ${job.messageId}: ${error.status} from the model provider, not retryable — ${error.detail ?? error.message}`,
+      );
+      await this.telegram.sendMessage(job.chatId, NOT_CONFIGURED_MESSAGE);
+      return { ok: false, outcome: { status: 'not_configured' } };
+    }
+  }
+
+  private async replyNotConfigured(job: TelegramMessageJob): Promise<void> {
+    this.logger.warn(
+      `Cannot route message ${job.messageId}: ANTHROPIC_API_KEY is ` +
+        `${this.llmConfig.missingVars.length > 0 ? 'missing' : 'a placeholder'}. ` +
+        'Replying with the not-configured message instead of retrying.',
+    );
+    await this.telegram.sendMessage(job.chatId, NOT_CONFIGURED_MESSAGE);
+  }
+
+  /**
    * The tenant's cached calendar timezone.
    *
    * Read from the users table rather than fetched from Google: the router has
@@ -339,6 +487,10 @@ export class RouterService {
    * user who has never connected a calendar.
    */
   private async timeZoneFor(tenantId: string): Promise<string> {
+    // Checked before the lookup, not after: an override that loses to a stale
+    // cached value would be no override at all.
+    if (this.timeZoneOverride) return this.timeZoneOverride;
+
     const user = await this.prisma.user.findUnique({
       where: { id: tenantId },
       select: { timeZone: true },

@@ -19,7 +19,8 @@ export interface ConflictCheckResult {
   hasConflict: boolean;
   conflicts: CalendarEvent[];
   /** Calendar timezone reported by the API, reused by the caller. */
-  timeZone: string;
+  /** Absent when Google reported none — callers apply their own default. */
+  timeZone?: string;
 }
 
 @Injectable()

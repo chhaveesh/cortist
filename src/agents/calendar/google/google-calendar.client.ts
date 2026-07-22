@@ -55,7 +55,9 @@ export class GoogleCalendarClient extends CalendarClient {
         events: (response.data.items ?? []).map((item) => this.toEvent(item)),
         // The list response carries the calendar's timezone — this is why the
         // agent can resolve "tomorrow at 3pm" without an extra OAuth scope.
-        timeZone: response.data.timeZone ?? 'UTC',
+        // No `?? 'UTC'`: an absent timezone is not a UTC timezone. The agent
+        // decides the fallback, because only it knows the configured default.
+        timeZone: response.data.timeZone ?? undefined,
       };
     });
   }

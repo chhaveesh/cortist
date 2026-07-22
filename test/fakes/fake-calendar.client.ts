@@ -31,7 +31,7 @@ export class FakeCalendarClient extends CalendarClient {
   /** Calls recorded in order, for asserting that nothing ran when it shouldn't. */
   readonly calls: Array<{ method: string; args: unknown }> = [];
 
-  constructor(private timeZone = 'Europe/London') {
+  constructor(private timeZone: string | undefined = 'Europe/London') {
     super();
   }
 
@@ -78,7 +78,7 @@ export class FakeCalendarClient extends CalendarClient {
     this.releaseCreateGate = undefined;
   }
 
-  setTimeZone(timeZone: string): void {
+  setTimeZone(timeZone: string | undefined): void {
     this.timeZone = timeZone;
   }
 

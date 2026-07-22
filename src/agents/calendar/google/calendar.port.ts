@@ -52,8 +52,14 @@ export interface ListEventsResult {
    * The calendar's own timezone, as reported by the list response. This is how
    * relative times ("tomorrow at 3") get resolved without requesting the extra
    * `calendar.settings.readonly` scope.
+   *
+   * Optional because Google does not always populate it, and the distinction
+   * matters: "Google says UTC" and "Google said nothing" used to collapse into
+   * the same hardcoded 'UTC', which was then cached on the user row forever.
+   * A user in IST had every "11:30am" placed at 11:30 UTC — 5pm on their own
+   * phone — with nothing anywhere recording that it was a guess.
    */
-  timeZone: string;
+  timeZone?: string;
 }
 
 /** Categorised Calendar API failure, so callers can react rather than guess. */

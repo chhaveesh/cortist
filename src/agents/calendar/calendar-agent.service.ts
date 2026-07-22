@@ -1,6 +1,9 @@
 import { Injectable, Logger } from '@nestjs/common';
+import { ConfigService } from '@nestjs/config';
 import { CalendarConfigService } from '../../config/calendar-config.service';
 import { PrismaService } from '../../prisma/prisma.service';
+import { zonedOffset, zonedParts } from '../../common/zoned-time';
+import { Env } from '../../config/env.schema';
 import { TelegramMessageJob } from '../../common/contracts/telegram-message.job';
 import {
   MissingOAuthConnectionError,
@@ -18,6 +21,10 @@ import {
 import { CalendarIntent, EventQuery } from './intent/calendar-intent.schema';
 import { interpretConfirmation } from './pending-action/confirmation-reply';
 import {
+  DURATION_OPTIONS,
+  interpretDuration,
+} from './pending-action/duration-reply';
+import {
   PendingActionPayload,
   PendingActionService,
 } from './pending-action/pending-action.service';
@@ -32,6 +39,8 @@ export type CalendarAgentOutcome =
   | { status: 'needs_connection' }
   | { status: 'clarification_requested' }
   | { status: 'event_created'; eventId: string }
+  | { status: 'events_listed'; count: number }
+  | { status: 'duration_requested' }
   | { status: 'conflict_reported'; conflicts: number }
   | {
       status: 'confirmation_requested';
@@ -49,6 +58,19 @@ const DEFAULT_EVENT_MINUTES = 60;
 
 /** How far around an event query to search when the model gave no window. */
 const DEFAULT_SEARCH_WINDOW_DAYS = 30;
+
+/** Window for "what's on my calendar?" when the user named no period. */
+const DAY_MS = 24 * 60 * 60 * 1000;
+
+/** Window for a search with no period — wide enough for anything annual. */
+const YEAR_MS = 365 * DAY_MS;
+
+/**
+ * Cap on events listed in one reply. Beyond this the message stops being
+ * readable on a phone, and the count of what was omitted is more useful than
+ * the omitted entries themselves.
+ */
+const MAX_LISTED_EVENTS = 10;
 
 /**
  * The calendar agent.
@@ -74,7 +96,14 @@ export class CalendarAgentService {
     private readonly oauthState: OAuthStateService,
     private readonly telegram: TelegramSenderService,
     private readonly prisma: PrismaService,
-  ) {}
+    config: ConfigService<Env, true>,
+  ) {
+    this.defaultTimeZone = config.get('DEFAULT_TIMEZONE', { infer: true });
+    this.timeZoneOverride = config.get('TIMEZONE_OVERRIDE', { infer: true });
+  }
+
+  private readonly defaultTimeZone: string;
+  private readonly timeZoneOverride?: string;
 
   /**
    * True when this agent is waiting on the tenant's next message.
@@ -101,6 +130,13 @@ export class CalendarAgentService {
     const pendingAction = await this.pending.get(job.tenantId, now);
     if (!pendingAction) {
       return { status: 'skipped', reason: 'not_calendar_related' };
+    }
+
+    // A duration question is not a yes/no question, so it must be read first —
+    // "30 minutes" is `unclear` to the confirmation parser, which would send it
+    // down the supersede path and lose the half-built event.
+    if (pendingAction.type === 'awaiting_duration') {
+      return this.handleDurationReply(job, pendingAction, now);
     }
 
     const reply = interpretConfirmation(job.text);
@@ -223,6 +259,20 @@ export class CalendarAgentService {
         return { status: 'clarification_requested' };
 
       case 'create_event':
+        if (!intent.durationGiven) {
+          return this.askForDuration(
+            job,
+            timeZone,
+            {
+              title: intent.title,
+              start: intent.startTime,
+              location: intent.location,
+              description: intent.description,
+            },
+            now,
+          );
+        }
+
         return this.createEvent(job, accessToken, timeZone, {
           title: intent.title,
           start: intent.startTime,
@@ -231,12 +281,95 @@ export class CalendarAgentService {
           description: intent.description,
         });
 
+      case 'query_events':
+        return this.listEvents(job, accessToken, timeZone, now, intent);
+
       case 'reschedule_event':
         return this.prepareReschedule(job, accessToken, timeZone, now, intent);
 
       case 'delete_event':
         return this.prepareDelete(job, accessToken, now, intent.eventQuery);
     }
+  }
+
+  // -------------------------------------------------------------------------
+  // query — read-only, so no confirmation and no conflict check
+  // -------------------------------------------------------------------------
+
+  /**
+   * Answers "what's on my calendar?".
+   *
+   * Read-only, which is why it skips every gate the other actions run through:
+   * nothing is created, moved, or destroyed, so there is nothing to confirm and
+   * no clash to detect.
+   *
+   * This action was missing until it was noticed that the README's own
+   * onboarding step — "message your bot 'what's on my calendar tomorrow?'" —
+   * routed to `unrelated` and never reached this agent, so a new user had no
+   * way to trigger the OAuth link at all. The model was right to route it away:
+   * the capability genuinely did not exist.
+   */
+  private async listEvents(
+    job: TelegramMessageJob,
+    accessToken: string,
+    timeZone: string,
+    now: Date,
+    intent: { startTime?: string; endTime?: string; searchQuery?: string },
+  ): Promise<CalendarAgentOutcome> {
+    const searching = Boolean(intent.searchQuery);
+
+    // Two different questions, so two different default windows.
+    //
+    // "What's on my calendar?" means now — the next 24 hours. But "when is
+    // Sam's birthday?" is a search, and answering it with today's events (which
+    // is what happened before there was a search term at all) is a confidently
+    // wrong answer. A year covers anything annual.
+    const timeMin = intent.startTime ?? now.toISOString();
+    const timeMax =
+      intent.endTime ??
+      new Date(
+        new Date(timeMin).getTime() + (searching ? YEAR_MS : DAY_MS),
+      ).toISOString();
+
+    const { events } = await this.calendar.listEvents(accessToken, {
+      timeMin,
+      timeMax,
+      maxResults: MAX_LISTED_EVENTS,
+      query: intent.searchQuery,
+    });
+
+    if (events.length === 0) {
+      await this.telegram.sendMessage(
+        job.chatId,
+        searching
+          ? `I couldn't find anything matching "${intent.searchQuery}" on your calendar in the next year.`
+          : `Nothing on your calendar between ${this.formatWhen(timeMin, timeZone)} and ${this.formatWhen(timeMax, timeZone)}.`,
+      );
+      return { status: 'events_listed', count: 0 };
+    }
+
+    // Start AND end, because "how much duration is the gym for?" is a question
+    // a listing should already answer. Showing only the start meant the reply
+    // was technically about the right event and still useless.
+    const lines = events.slice(0, MAX_LISTED_EVENTS).map((event) => {
+      const when = event.allDay
+        ? `${this.formatWhen(event.start, timeZone)} (all day)`
+        : `${this.formatWhen(event.start, timeZone)}–${this.formatTimeOnly(event.end, timeZone)}`;
+      return `• ${when} — ${event.title}`;
+    });
+
+    // Say so rather than silently truncating: a list that looks complete but
+    // is not is worse than a longer message.
+    if (events.length > MAX_LISTED_EVENTS) {
+      lines.push(`…and ${events.length - MAX_LISTED_EVENTS} more.`);
+    }
+
+    await this.telegram.sendMessage(
+      job.chatId,
+      `📅 ${events.length === 1 ? '1 event' : `${events.length} events`}:\n\n${lines.join('\n')}`,
+    );
+
+    return { status: 'events_listed', count: events.length };
   }
 
   // -------------------------------------------------------------------------
@@ -309,6 +442,7 @@ export class CalendarAgentService {
     intent: {
       eventQuery: EventQuery;
       newStartTime: string;
+      newDateGiven?: boolean;
       newEndTime?: string;
     },
   ): Promise<CalendarAgentOutcome> {
@@ -323,7 +457,18 @@ export class CalendarAgentService {
     }
 
     const target = resolution.event;
-    const newStart = intent.newStartTime;
+
+    // "Move it to 5pm" means 5pm on the day the event is already on.
+    //
+    // The classifier cannot do this itself: it never sees the event, so asked
+    // for an absolute timestamp it can only anchor to today. In testing that
+    // silently proposed moving a Friday appointment to Thursday — caught only
+    // because the confirmation names both times. The agent has the event, so
+    // the arithmetic belongs here.
+    const newStart = intent.newDateGiven
+      ? intent.newStartTime
+      : rebaseOntoDayOf(target.start, intent.newStartTime, timeZone);
+
     const newEnd = intent.newEndTime ?? this.preserveDuration(target, newStart);
 
     // Exclude the event being moved, or it would conflict with its own old slot.
@@ -453,6 +598,12 @@ export class CalendarAgentService {
     }
 
     try {
+      if (pendingAction.type === 'awaiting_duration') {
+        // Unreachable: handleFollowUp routes these away above. Kept explicit so
+        // the compiler proves it rather than the reader assuming it.
+        return { status: 'skipped', reason: 'not_calendar_related' };
+      }
+
       if (pendingAction.type === 'delete_event') {
         await this.calendar.deleteEvent(accessToken, pendingAction.eventId);
         await this.telegram.sendMessage(
@@ -480,6 +631,106 @@ export class CalendarAgentService {
     }
 
     return { status: 'confirmed', actionType: pendingAction.type };
+  }
+
+  // -------------------------------------------------------------------------
+  // duration — asked for rather than assumed
+  // -------------------------------------------------------------------------
+
+  /**
+   * Asks how long a new event should be, offering the common answers.
+   *
+   * The alternative — silently assuming an hour, which is what the prompt used
+   * to instruct — invents a commitment length the user never chose and then
+   * blocks that slot against everything else. Asking costs one message; a
+   * wrong end time costs a conflict that is not real.
+   */
+  private async askForDuration(
+    job: TelegramMessageJob,
+    timeZone: string,
+    input: {
+      title: string;
+      start: string;
+      location?: string;
+      description?: string;
+    },
+    now: Date,
+  ): Promise<CalendarAgentOutcome> {
+    await this.pending.set(
+      job.tenantId,
+      {
+        type: 'awaiting_duration',
+        title: input.title,
+        startTime: input.start,
+        timeZone,
+        location: input.location,
+        description: input.description,
+      },
+      now,
+    );
+
+    await this.telegram.sendMessage(
+      job.chatId,
+      `How long is "${input.title}" on ${this.formatWhen(input.start, timeZone)}?`,
+      { quickReplies: [...DURATION_OPTIONS] },
+    );
+
+    return { status: 'duration_requested' };
+  }
+
+  /** Turns "30 minutes" into an end time, then creates the event. */
+  private async handleDurationReply(
+    job: TelegramMessageJob,
+    pendingAction: Extract<PendingActionPayload, { type: 'awaiting_duration' }>,
+    now: Date,
+  ): Promise<CalendarAgentOutcome> {
+    const minutes = interpretDuration(job.text);
+
+    if (minutes === null) {
+      // Not a duration. Left pending on purpose: the router classifies next,
+      // and a genuine new request supersedes this one — the same rule that
+      // governs an unclear confirmation (§25).
+      return { status: 'unclear_reply' };
+    }
+
+    const claimed = await this.pending.claim(job.tenantId, now);
+    if (!claimed || claimed.type !== 'awaiting_duration') {
+      // Expired, or another message won the race.
+      return { status: 'skipped', reason: 'not_calendar_related' };
+    }
+
+    let accessToken: string;
+    try {
+      accessToken = await this.tokens.getAccessToken(job.tenantId);
+    } catch (error) {
+      if (
+        error instanceof MissingOAuthConnectionError ||
+        error instanceof OAuthReauthorizationRequiredError
+      ) {
+        await this.sendConnectPrompt(job);
+        return { status: 'needs_connection' };
+      }
+      throw error;
+    }
+
+    const end = new Date(
+      new Date(claimed.startTime).getTime() + minutes * 60_000,
+    ).toISOString();
+
+    try {
+      return await this.createEvent(job, accessToken, claimed.timeZone, {
+        title: claimed.title,
+        start: claimed.startTime,
+        end,
+        location: claimed.location,
+        description: claimed.description,
+      });
+    } catch (error) {
+      if (error instanceof CalendarApiError) {
+        return this.handleCalendarError(job, error);
+      }
+      throw error;
+    }
   }
 
   // -------------------------------------------------------------------------
@@ -520,11 +771,18 @@ export class CalendarAgentService {
           now.getTime() + DEFAULT_SEARCH_WINDOW_DAYS * 86_400_000,
         ).toISOString();
 
-    const { events, timeZone } = await this.calendar.listEvents(accessToken, {
-      timeMin,
-      timeMax,
-      query: query.titleContains?.trim() || undefined,
-    });
+    const { events, timeZone: reported } = await this.calendar.listEvents(
+      accessToken,
+      {
+        timeMin,
+        timeMax,
+        query: query.titleContains?.trim() || undefined,
+      },
+    );
+
+    // Same rule as resolveTimeZone: the override wins, and an absent timezone
+    // is not UTC.
+    const timeZone = this.timeZoneOverride ?? reported ?? this.defaultTimeZone;
 
     const candidates = events.filter((event) => !event.allDay);
 
@@ -573,11 +831,26 @@ export class CalendarAgentService {
   ): Promise<string> {
     // A one-hour lookahead is the cheapest call that still returns the
     // calendar's timeZone field.
+    // Skips the lookup entirely when pinned: no call to make, and nothing
+    // Google could say would change the answer.
+    if (this.timeZoneOverride) return this.timeZoneOverride;
+
     const { timeZone } = await this.calendar.listEvents(accessToken, {
       timeMin: now.toISOString(),
       timeMax: new Date(now.getTime() + 3_600_000).toISOString(),
       maxResults: 1,
     });
+
+    if (!timeZone) {
+      // Deliberately NOT cached. Caching a guess is how a user ends up
+      // permanently in the wrong zone with no record that it was ever a guess —
+      // and the next call might get a real answer.
+      this.logger.warn(
+        `Google reported no calendar timezone for tenant ${tenantId}; ` +
+          `falling back to DEFAULT_TIMEZONE (${this.defaultTimeZone}) for this request only.`,
+      );
+      return this.defaultTimeZone;
+    }
 
     // Best effort: a failed cache write must not fail the user's request.
     await this.prisma.user
@@ -661,6 +934,22 @@ export class CalendarAgentService {
   }
 
   /** Human-readable time in the user's own timezone. */
+  /** Just the clock time, for the end of a range whose day is already shown. */
+  private formatTimeOnly(iso: string, timeZone: string): string {
+    const date = new Date(iso);
+    if (Number.isNaN(date.getTime())) return iso;
+
+    try {
+      return new Intl.DateTimeFormat('en-GB', {
+        hour: '2-digit',
+        minute: '2-digit',
+        timeZone,
+      }).format(date);
+    } catch {
+      return date.toISOString();
+    }
+  }
+
   private formatWhen(iso: string, timeZone: string): string {
     const date = new Date(iso);
     if (Number.isNaN(date.getTime())) return iso;
@@ -678,5 +967,38 @@ export class CalendarAgentService {
       // An unrecognised IANA zone must not break the reply.
       return date.toISOString();
     }
+  }
+}
+
+/**
+ * Puts the time-of-day from `time` onto the calendar day of `day`, in the
+ * user's timezone.
+ *
+ * Both instants are interpreted in `timeZone` rather than UTC, because "5pm"
+ * means 5pm where the user is. The offset is taken from the target day itself,
+ * so a move across a DST boundary lands on the wall-clock time the user asked
+ * for rather than an hour either side of it.
+ */
+export function rebaseOntoDayOf(
+  day: string,
+  time: string,
+  timeZone: string,
+): string {
+  const dayDate = new Date(day);
+  const timeDate = new Date(time);
+  if (Number.isNaN(dayDate.getTime()) || Number.isNaN(timeDate.getTime())) {
+    return time;
+  }
+
+  try {
+    const datePart = zonedParts(dayDate, timeZone);
+    const timePart = zonedParts(timeDate, timeZone);
+    const offset = zonedOffset(dayDate, timeZone);
+
+    return `${datePart.year}-${datePart.month}-${datePart.day}T${timePart.hour}:${timePart.minute}:00${offset}`;
+  } catch {
+    // An unrecognised IANA zone must not turn a reschedule into an error; the
+    // model's own timestamp is a worse answer but still a usable one.
+    return time;
   }
 }

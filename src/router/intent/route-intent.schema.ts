@@ -37,6 +37,7 @@ export type RouteName = (typeof ROUTES)[number];
 
 export const CALENDAR_ACTIONS = [
   'create_event',
+  'query_events',
   'reschedule_event',
   'delete_event',
   'needs_clarification',
@@ -86,6 +87,18 @@ export const routeExtractionSchema = z.object({
   newStartTime: z
     .string()
     .describe('ISO-8601 new start for reschedule, else empty.'),
+  durationGiven: z
+    .boolean()
+    .default(false)
+    .describe(
+      'True only if the user stated a duration or end time for a new event.',
+    ),
+  newDateGiven: z
+    .boolean()
+    .default(false)
+    .describe(
+      'True only if the user named a DATE for the new time. False for a bare time like "move it to 5pm".',
+    ),
   newEndTime: z
     .string()
     .describe('ISO-8601 new end for reschedule. Empty preserves the duration.'),
@@ -174,6 +187,16 @@ export const routeExtractionJsonSchema = {
       type: 'string',
       description: 'ISO-8601 new start for reschedule, else empty.',
     },
+    durationGiven: {
+      type: 'boolean',
+      description:
+        'True ONLY if the user stated a duration or an end time ("for an hour", "9 to 11"). False when they gave only a start time.',
+    },
+    newDateGiven: {
+      type: 'boolean',
+      description:
+        'True ONLY if the user named a date for the new time ("move it to Monday at 5pm"). False for a bare time ("move it to 5pm") — the agent then keeps the event on its existing day.',
+    },
     newEndTime: {
       type: 'string',
       description:
@@ -205,7 +228,9 @@ export const routeExtractionJsonSchema = {
     'location',
     'description',
     'eventQuery',
+    'durationGiven',
     'newStartTime',
+    'newDateGiven',
     'newEndTime',
     'clarifyingQuestion',
     'contentToStore',
@@ -249,7 +274,25 @@ export function isAmbiguous(raw: RouteExtraction): boolean {
   return (
     raw.confidence !== 'high' &&
     raw.alternative !== 'none' &&
-    raw.alternative !== raw.route
+    raw.alternative !== raw.route &&
+    // `unrelated` is not a choosable alternative.
+    //
+    // Ambiguity means "which of two things did you want?", and the question is
+    // only worth asking when both answers are actions the user could pick.
+    // With `unrelated` as the runner-up the question becomes "did you mean your
+    // saved documents, or something else?" — which asks the user to confirm a
+    // capability rather than choose between two, and there is no useful answer
+    // to give. Observed live: "what's the API rate limit?" (medium confidence,
+    // runner-up `unrelated`) asked that question, the user replied "yes", and
+    // the router had to give up — costing three messages to answer a question
+    // it had already routed correctly on the first one.
+    //
+    // A runner-up of `unrelated` means the model was unsure whether it could
+    // help at all, not which capability applies. Routing to its first choice
+    // and letting the agent handle a miss is strictly better than an
+    // unanswerable question.
+    raw.alternative !== 'unrelated' &&
+    raw.route !== 'unrelated'
   );
 }
 
@@ -279,10 +322,12 @@ export function narrowRoute(raw: RouteExtraction): RoutingDecision {
           title: raw.title,
           startTime: raw.startTime,
           endTime: raw.endTime,
+          durationGiven: raw.durationGiven,
           location: raw.location,
           description: raw.description,
           eventQuery: raw.eventQuery,
           newStartTime: raw.newStartTime,
+          newDateGiven: raw.newDateGiven,
           newEndTime: raw.newEndTime,
           clarifyingQuestion: raw.clarifyingQuestion,
         }),

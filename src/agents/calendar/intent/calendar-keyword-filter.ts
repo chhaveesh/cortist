@@ -16,8 +16,18 @@
  */
 
 const KEYWORD_PATTERNS: RegExp[] = [
-  // Calendar nouns
+  // Calendar nouns.
+  //
+  // "calender" is here because it is one of the most common misspellings in
+  // English, and this filter fails silently: a real user typed "list all the
+  // birthdays saved in my calender" and got no reply at all, because the only
+  // calendar-ish word in it was misspelled. Spelling is not something to hold
+  // against someone talking to a chat bot.
   /\bcalendar(s)?\b/i,
+  /\bcalender(s)?\b/i,
+  /\bcalandar(s)?\b/i,
+  /\bbirthday(s)?\b/i,
+  /\banniversary|anniversaries\b/i,
   /\bevent(s)?\b/i,
   /\bmeeting(s)?\b/i,
   /\bappointment(s)?\b/i,

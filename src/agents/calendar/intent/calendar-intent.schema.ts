@@ -23,6 +23,7 @@ import { z } from 'zod';
 
 export const CALENDAR_INTENTS = [
   'create_event',
+  'query_events',
   'reschedule_event',
   'delete_event',
   'needs_clarification',
@@ -96,6 +97,38 @@ export const calendarExtractionSchema = z.object({
   eventQuery: eventQuerySchema.describe(
     'How to find the existing event, for reschedule_event and delete_event.',
   ),
+  /**
+   * Whether the user actually named a DATE for the new time.
+   *
+   * Load-bearing, and the reason it exists is worth stating: the classifier
+   * never sees the event it is moving, so asked for an absolute timestamp for
+   * "move it to 5pm" it can only anchor to today — which silently moved a real
+   * appointment a day earlier in testing. The agent knows the event's date, so
+   * it rebases the time when this is false. The model is only asked what the
+   * user said, which is something it can actually know.
+   */
+  /**
+   * Whether the user actually stated how long the event should last.
+   *
+   * The model used to be told to "assume one hour if no duration was given",
+   * which quietly invented a commitment length the user never chose. Recording
+   * what they *said* lets the agent ask instead — and asking is cheap, whereas
+   * a wrong end time silently blocks a real slot.
+   */
+  durationGiven: z
+    .boolean()
+    .default(false)
+    .describe(
+      'True only if the user said how long the event lasts or when it ends ("for an hour", "9 to 11", "a 30 minute sync").',
+    ),
+
+  newDateGiven: z
+    .boolean()
+    .default(false)
+    .describe(
+      'True only if the user named a date for the new time ("move it to Monday at 5pm"). False for a bare time ("move it to 5pm").',
+    ),
+
   newStartTime: z
     .string()
     .describe(
@@ -196,6 +229,16 @@ export const calendarExtractionJsonSchema = {
       description:
         'ISO-8601 new start with offset, for reschedule_event. Empty string otherwise.',
     },
+    durationGiven: {
+      type: 'boolean',
+      description:
+        'True ONLY if the user stated a duration or an end time ("for an hour", "9 to 11", "30 minute sync"). False when they gave only a start time.',
+    },
+    newDateGiven: {
+      type: 'boolean',
+      description:
+        'True ONLY if the user named a date for the new time ("move it to Monday at 5pm"). False for a bare time ("move it to 5pm").',
+    },
     newEndTime: {
       type: 'string',
       description:
@@ -216,7 +259,9 @@ export const calendarExtractionJsonSchema = {
     'location',
     'description',
     'eventQuery',
+    'durationGiven',
     'newStartTime',
+    'newDateGiven',
     'newEndTime',
     'clarifyingQuestion',
   ],
@@ -234,14 +279,39 @@ export type CalendarIntent =
       title: string;
       startTime: string;
       endTime: string;
+      /** False when the user gave no duration; the agent asks rather than assuming. */
+      durationGiven: boolean;
       location?: string;
       description?: string;
+    }
+  | {
+      /**
+       * Read-only: "what's on my calendar tomorrow?".
+       *
+       * The window is optional because the commonest phrasing gives no dates at
+       * all ("what's on my calendar?"), and refusing to answer that would be
+       * absurd. The agent defaults it, since only the agent knows `now`.
+       */
+      intent: 'query_events';
+      confidence: Confidence;
+      startTime?: string;
+      endTime?: string;
+      /**
+       * What the user is looking for, when they named something specific.
+       *
+       * Without this, "when is Chhaveesh's birthday?" had nowhere to put the
+       * subject and collapsed into "what is on today" — which listed three
+       * unrelated events and looked like a confidently wrong answer.
+       */
+      searchQuery?: string;
     }
   | {
       intent: 'reschedule_event';
       confidence: Confidence;
       eventQuery: EventQuery;
       newStartTime: string;
+      /** False when the user gave a bare time; the agent rebases onto the event's day. */
+      newDateGiven: boolean;
       newEndTime?: string;
     }
   | {
@@ -288,12 +358,31 @@ export function narrowIntent(raw: CalendarExtraction): CalendarIntent {
         title: raw.title.trim(),
         startTime: raw.startTime,
         endTime: raw.endTime,
+        durationGiven: raw.durationGiven ?? false,
         ...(blank(raw.location) ? {} : { location: raw.location.trim() }),
         ...(blank(raw.description)
           ? {}
           : { description: raw.description.trim() }),
       };
     }
+
+    case 'query_events':
+      // No completeness check: a query with no window is the normal case, not
+      // an incomplete request. Nothing is written, so a wrong window costs the
+      // user a re-ask rather than a wrong event in their calendar — which is
+      // why this reads nothing like the create/reschedule/delete gates above.
+      return {
+        intent: 'query_events',
+        confidence,
+        ...(blank(raw.startTime) ? {} : { startTime: raw.startTime }),
+        ...(blank(raw.endTime) ? {} : { endTime: raw.endTime }),
+        // Reuses eventQuery.titleContains rather than adding a field: it
+        // already means "how to find an existing event", which is exactly
+        // this.
+        ...(blank(raw.eventQuery.titleContains)
+          ? {}
+          : { searchQuery: raw.eventQuery.titleContains.trim() }),
+      };
 
     case 'reschedule_event': {
       if (blank(raw.newStartTime) || isEmptyQuery(raw.eventQuery)) {
@@ -308,6 +397,7 @@ export function narrowIntent(raw: CalendarExtraction): CalendarIntent {
         confidence,
         eventQuery: raw.eventQuery,
         newStartTime: raw.newStartTime,
+        newDateGiven: raw.newDateGiven ?? false,
         ...(blank(raw.newEndTime) ? {} : { newEndTime: raw.newEndTime }),
       };
     }

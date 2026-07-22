@@ -13,6 +13,10 @@ A Telegram-based AI personal assistant.
 - **Phase 4a** — the intent router: one classification per message, then clean
   dispatch to exactly one agent, with a clarifying question instead of a guess
   when a message is genuinely ambiguous.
+- **Phase 4a hardening** — what the first real end-to-end run found. Nine
+  defects, a second LLM provider, and three capabilities the calendar agent
+  turned out to be missing. See `e2e_test.md` for the run log and
+  DECISIONS.md §52–59 for the reasoning.
 
 Task and email agents arrive in later phases and plug into the same queue
 contract described below.
@@ -55,7 +59,8 @@ Verify it is alive:
 
 ```bash
 curl localhost:3000/health
-# {"status":"ok","redis":"connected","postgres":"connected","calendar":"configured"}
+# {"status":"ok","redis":"connected","postgres":"connected",
+#  "calendar":"configured","router":"configured"}
 ```
 
 Send a simulated Telegram delivery (no bot token or public URL needed):
@@ -130,7 +135,7 @@ POST the same payload again and the response becomes
 │  2. keyword pre-filter     → skip without an LLM call    │
 │  3. credentials present?   → else "not configured" reply │
 │  4. no calendar connected? → reply with an OAuth link    │
-│  5. classify intent (Claude Haiku 4.5, structured output)│
+│  5. (the router classified it — see below)               │
 │  6. create      → conflict-check, then execute           │
 │     reschedule  → resolve event, conflict-check, ASK     │
 │     delete      → resolve event, ASK                     │
@@ -264,6 +269,10 @@ npm install
 npm run test:e2e     # unit + integration + end-to-end, fully dockerized
 ```
 
+`e2e_test.md` is the companion guide: five tiers from a cold checkout to a real
+bot on a real calendar, including the run log from the first full pass — what
+passed, the nine defects it found, and which remain open.
+
 Tiers can also be run individually:
 
 ```bash
@@ -289,15 +298,16 @@ exercised by CI. That matters for one thing in particular: whether it asks
 instead of guessing. `"book something for 9"` — 9am or 9pm? Guessing puts a real
 event in someone's calendar at the wrong time, and no mock can catch it.
 
-```bash
-npm run eval:intent              # every fixture, against the real API
-npm run eval:intent -- ambiguous # just the ambiguous ones
-```
+Needs a real key for whichever provider `LLM_PROVIDER` names, and costs a few
+cents (or nothing, on Gemini's free tier). Clear fixtures fail the run; ambiguous
+ones print `≈` and never fail — they're there to be read, not passed. Add your
+own phrasings to `scripts/eval-router.ts`.
 
-Needs `ANTHROPIC_API_KEY` and costs a few cents. Clear fixtures fail the run;
-ambiguous ones print `≈` and never fail — they're there to be read, not passed.
-It also flags when the keyword pre-filter would have dropped a phrasing before
-the model ever saw it. Add your own phrasings to `scripts/eval-intent.ts`.
+> `npm run eval:intent` no longer exists. Phase 4a merged routing and extraction
+> into one call, and the script still imported the classifier that refactor
+> deleted — it had been failing to compile ever since, while the README
+> advertised it. Its fixtures now live in `eval:router`, which already prints
+> extracted titles and times. See DECISIONS.md §59.
 
 That one command starts isolated Postgres and Redis containers, applies
 migrations, runs every suite, and tears the containers down again. It needs no
@@ -341,6 +351,13 @@ KEEP_TEST_STACK=1 npm run test:e2e   # leave containers up to iterate on a failu
 | Integration | `test/integration/rag-tenant-isolation.integration-spec.ts` | **the one that matters** — adversarial cross-tenant checks |
 | Integration | `test/integration/rag-ingestion.integration-spec.ts` | PDF / text / URL ingestion, rejections, chunk rows |
 | Integration | `test/integration/rag-retrieval.integration-spec.ts` | citations, similarity floor, model declining |
+| Unit | `test/unit/router-degradation.spec.ts` | honest degradation when the model is unconfigured or 4xx |
+| Unit | `test/unit/llm-provider.spec.ts` | provider selection, placeholder detection, retry classification |
+| Unit | `test/unit/zoned-time.spec.ts` | local wall-clock across the offset boundary, DST, bad zones |
+| Unit | `test/unit/duration-reply.spec.ts` | every button, typed answers, and the non-answers it must refuse |
+| Unit | `test/unit/timezone-override.spec.ts` | the override beats a cached per-user zone |
+| Integration | `test/integration/calendar-query.integration-spec.ts` | listing, searching by name, and the **OAuth link when unconnected** |
+| Integration | `test/integration/calendar-duration.integration-spec.ts` | asks, creates nothing while waiting, still conflict-checks the answer |
 | End-to-end | `test/e2e/calendar-chain.e2e-spec.ts` | webhook → queue → worker → agent → reply, **routed to the right chat** |
 | End-to-end | `test/e2e/pipe.e2e-spec.ts` | gateway → queue → **real worker** → Postgres |
 | End-to-end | `test/e2e/shutdown.e2e-spec.ts` | SIGTERM drain, no stranded jobs, clean handover |
@@ -417,7 +434,9 @@ The tradeoff is real: retrieval quality is below a current hosted model. The
 model (~97MB) is baked into the Docker image at build time, so the container
 needs no egress at inference and loads it in well under a second.
 
-Classification, summarisation, and grounded answering still use Claude Haiku 4.5.
+Classification, summarisation, and grounded answering use whichever provider
+`LLM_PROVIDER` names — Gemini by default, Anthropic if you prefer. See
+[Choosing an LLM provider](#choosing-an-llm-provider).
 
 ### Storage
 
@@ -475,11 +494,29 @@ Needs a real bot token (see the calendar walkthrough) and `ANTHROPIC_API_KEY`.
 
 | You say | It does |
 | --- | --- |
-| "book a dentist appointment tomorrow at 9" | Checks for clashes, then **creates it** and confirms |
+| "what's on my calendar tomorrow?" | Lists the day's events as `start–end` ranges |
+| "when is Sam's birthday?" | Searches a **year** by name, and says so plainly if it finds nothing |
+| "book a dentist appointment tomorrow at 9 **for an hour**" | Checks for clashes, then **creates it** and confirms |
+| "book a dentist appointment tomorrow at 9" *(no duration)* | **Asks how long**, offering 30 minutes / 1 hour / 2 hours as taps |
 | "move my dentist appointment to 2pm" | Resolves the event, checks the new slot, then **asks before moving** |
 | "cancel my dentist appointment" | Resolves the event, then **asks before deleting** |
 | "reschedule my call" (with three calls) | Lists them and asks which one |
 | "what's the capital of France?" | Nothing — filtered out before any LLM call |
+
+### Asking rather than assuming
+
+A create with no stated duration asks *"How long is X?"* and offers 30 minutes /
+1 hour / 2 hours as tappable quick replies. The prompt used to tell the model to
+assume an hour, which invents a commitment length the user never chose and blocks
+that slot against everything else — including reporting conflicts that are not
+real.
+
+Those are **reply-keyboard** buttons, not inline ones. Tapping sends an ordinary
+text message, so the answer arrives through the same webhook → queue → router
+path as anything typed; inline buttons post a `callback_query`, a different
+update type the gateway, the job contract, and the router would each have to
+learn. Typing works too — `45 mins`, `1h30`, `half an hour` all parse — because a
+keyboard does not stop anyone typing. See DECISIONS.md §57.
 
 **Create executes directly; delete and reschedule require an explicit "yes".**
 Creating is additive, conflict-checked, and trivially undone — and the summary
@@ -501,7 +538,15 @@ and queued — and only the calendar path degrades:
 ```bash
 curl localhost:3000/health
 # {"status":"ok", ..., "calendar":"not_configured",
-#  "calendarMissing":["GOOGLE_CLIENT_ID","ANTHROPIC_API_KEY"]}
+#  "calendarMissing":[], "calendarPlaceholder":["GOOGLE_CLIENT_ID","GEMINI_API_KEY"],
+#  "router":"not_configured", "routerPlaceholder":["GEMINI_API_KEY"]}
+
+`calendarMissing` and `calendarPlaceholder` are reported separately on purpose:
+being told a variable is "missing" when you can see it in your own `.env` sends
+you looking for the wrong thing. A credential that is present but still holds its
+`.env.example` value does **not** count as configured — the setup the quick start
+recommends would otherwise report a fully configured system that fails on its
+first request (DECISIONS.md §52).
 ```
 
 A calendar request gets an honest "this isn't configured on my side" reply;
@@ -528,6 +573,47 @@ fixed by retrying, so the agent prompts you to reconnect instead.
 
 Both tokens are encrypted at rest with **AES-256-GCM** before they touch the
 database. Nothing in `oauth_tokens` is readable without `TOKEN_ENCRYPTION_KEY`.
+
+### Timezones
+
+Relative times ("tomorrow at 3") are resolved against **the user's own
+wall-clock time**, which the router hands the model directly — already converted,
+with the weekday. Handing over a UTC timestamp and a zone name and letting the
+model convert put every "today" a day behind after 18:30 IST, and did so only on
+weaker models: correctness rested on model strength rather than on code
+(DECISIONS.md §58).
+
+The zone comes from the calendar's own `timeZone`, cached on the user row. When
+Google reports none, `DEFAULT_TIMEZONE` applies for that request and is **not**
+cached — a cached guess is indistinguishable from a real answer, which is exactly
+how one account ended up with every "11:30am" placed at 17:00.
+
+`TIMEZONE_OVERRIDE` pins one zone for every user, ignoring Google entirely. It is
+a blunt instrument for single-region deployments and wrong the moment someone
+outside that zone connects, so `/health` reports it when set.
+
+### Choosing an LLM provider
+
+`LLM_PROVIDER=gemini` (default) or `anthropic`. Only the selected provider's key
+is required — `/health` names the one that is actually missing rather than the
+one you are not using.
+
+| | Gemini | Anthropic |
+| --- | --- | --- |
+| Key from | [AI Studio](https://aistudio.google.com/apikey) | [console.anthropic.com](https://console.anthropic.com/settings/keys) |
+| Free tier | yes, no card | no — API credit is separate from a Claude subscription |
+| Model variable | `GEMINI_MODEL` | `ANTHROPIC_MODEL` |
+
+`RouteClassifier` and `RagLlm` have been abstract since Phases 2 and 3, justified
+partly as "the model is swappable". Adding Gemini is the first thing to test that
+claim rather than assert it — and it held: no change to the router, the agents,
+the schemas, or any test. Gemini's `responseJsonSchema` accepts the existing JSON
+Schemas verbatim, so there is no translation layer to drift.
+
+`GEMINI_MODEL` defaults to `gemini-flash-lite-latest`. An alias rather than a
+pinned version, because pinned names return 404 for keys created after those
+models closed to new signups — and *lite* because `gemini-flash-latest` currently
+allows **20 free requests per day**, which one testing session exhausts.
 
 ### Google Cloud Console setup
 
@@ -583,8 +669,11 @@ Telegram to reach (e.g. `ngrok http 3000`, then set `PUBLIC_BASE_URL` and
      -d "secret_token=$TELEGRAM_WEBHOOK_SECRET"
    ```
 3. **Connect** — message your bot "what's on my calendar tomorrow?". It should
-   reply with a link. Follow it, consent, and confirm you land on the "Calendar
-   connected" page and get a Telegram confirmation.
+   reply with a link. Follow it, click through **Advanced → Go to … (unsafe)**
+   (expected for an unverified Testing-mode app), consent, and confirm you land
+   on the "Calendar connected" page and get a Telegram confirmation.
+   - Until `query_events` existed this message routed to `unrelated` and no link
+     was ever sent, so a new user had no way to connect at all. See §56.
    - Verify the tokens are encrypted:
      ```bash
      docker compose exec postgres psql -U cortist -d cortist \
@@ -594,6 +683,9 @@ Telegram to reach (e.g. `ngrok http 3000`, then set `PUBLIC_BASE_URL` and
 4. **Create** — "book a dentist appointment tomorrow at 3pm for an hour".
    Confirm the event appears in Google Calendar at the right time *in your own
    timezone* — this is the check that the timezone resolution works.
+   - Then try one **without** a duration: "add a gym session at 11:30 tomorrow".
+     It must ask how long, offer three taps, and create **nothing** until you
+     answer.
 5. **Conflict** — ask for another event at the same time. It should refuse and
    name the clash, and **no** second event should appear.
 6. **Reschedule** — "move my dentist appointment to 5pm". Confirm it asks first;
@@ -701,6 +793,7 @@ src/
   app.module.ts              gateway composition root
   worker.module.root.ts      worker composition root
   common/contracts/          ← the queue contract (the Phase 2 seam)
+  common/zoned-time.ts       wall-clock time in a zone, for the model's prompt
   config/                    zod-validated environment
   telegram/                  webhook controller, secret guard, schema, ingestion
     outbound/                Bot API sender (the agent's voice)
@@ -709,12 +802,13 @@ src/
   users/                     tenant find-or-create
   prisma/ redis/ health/     infrastructure
   worker/                    BullMQ worker lifecycle + processor
+  llm/                       provider transport + retryable/not classification
   crypto/                    AES-256-GCM token encryption
   oauth/                     signed state, Google client, token store + refresh
   auth/                      GET /auth/google, /auth/google/callback  [gateway]
   router/                    ← the single entry point
     router.service.ts          classify once, then dispatch
-    intent/                    unified route+extract schema, classifier, filter
+    intent/                    unified route+extract schema, classifiers, prompt, filter
     clarification/             pending question store + reply parser
   agents/rag/                ← the second brain, self-contained
     rag-agent.service.ts       orchestrator; single entry point `handle(job)`
@@ -724,7 +818,8 @@ src/
     intent/                    own classifier — deliberately not shared
   agents/calendar/           ← the calendar agent, self-contained
     calendar-agent.service.ts  orchestrator; single entry point `handle(job)`
-    intent/                    wire schema, Anthropic classifier, keyword filter
+    intent/                    wire schema, both classifiers, keyword filter
+    pending-action/            confirmation store, yes/no and duration parsing
     google/                    CalendarClient port + googleapis impl
     conflict/                  overlap detection
     pending-action/            confirmation store + reply interpretation
@@ -746,6 +841,12 @@ immediately rather than surfacing later as a confusing runtime error.
 
 `TELEGRAM_BOT_TOKEN` is only needed to *send* messages (Phase 2+); a placeholder
 is fine for all of Phase 1, including the full test suite.
+
+A credential that is **present but still holds its `.env.example` value** counts
+as unconfigured, and `/health` says so. Note also that the test tier inherits any
+variable `.env.test` does not set — Nest loads `.env` alongside it — so
+`.env.test` sets every variable it depends on explicitly, blanking (`VAR=`)
+rather than omitting where it wants the default (§59).
 
 ## Registering a real webhook (optional, not needed for development)
 

@@ -1049,3 +1049,288 @@ fixed by migration, so a model swap needs a new migration *and* a backfill);
 OCR for scanned PDFs; document deletion and listing over Telegram; reranking;
 and tuning chunk size, overlap, and the similarity threshold against measured
 retrieval quality rather than judgement.
+
+---
+
+# Phase 4a hardening — the first real end-to-end run
+
+Everything above was reasoned about, unit-tested, and integration-tested. This
+section is what happened when the system was pointed at a real Telegram bot, a
+real Google Calendar, and a real user for the first time.
+
+Nine defects surfaced in one evening. Not one of them was found by reading the
+code — several had been sitting behind passing tests for weeks — and the pattern
+in how they hid is the most useful thing here.
+
+## 52. Presence is not configuration
+
+`/health` reported `calendar: "configured"` on a stack where every credential
+was still the `.env.example` placeholder. The check tested presence and
+emptiness, and `your-client-id.apps.googleusercontent.com` is neither absent nor
+empty.
+
+The consequence was not cosmetic. `cp .env.example .env` is the setup the README
+recommends, so the degraded-mode reply documented in §32 was **unreachable by
+anyone following the documented path**. The one state the health endpoint existed
+to make visible was the one state it could not report.
+
+`isPlaceholderValue` matches placeholder *shapes* — `^your-`, `change-me`,
+`^placeholder`, a hex secret of one repeated character — and deliberately never a
+vendor's key format. A check that rejects a working credential is far worse than
+one that misses a fake, and Anthropic and Google are free to change what a real
+key looks like tomorrow.
+
+Absences and placeholders are reported separately, which matters more than it
+sounds: being told `GOOGLE_CLIENT_ID` is "missing" when you can see it in your
+own `.env` sends you looking for entirely the wrong thing.
+
+The regression test parses the real `.env.example` rather than restating its
+values, so it keeps telling the truth if the example is edited.
+
+## 53. The router needed §32's judgement more than the calendar did
+
+Phase 2 made the calendar credentials optional and had the agent report itself
+unconfigured (§32). Phase 4a then put a classifier in front of *every* actionable
+message and gave it none of that.
+
+Observed: a bad API key threw 401 inside `RouteClassifier.classify`, BullMQ
+retried three times over ~6s, and the job landed in the failed set. Two things
+made it worse than a plain error. The user was told **nothing** — the throw
+happens before any agent composes a reply — and because the processed marker is
+written *after* the agent runs (§28), `processed_messages` recorded nothing
+either. From the user's side the message simply vanished.
+
+`classifyOrDegrade` now guards all three classification call sites. One helper
+rather than three checks, because the check is easy to forget at a call site and
+forgetting it restores exactly this failure.
+
+Two ordering details are load-bearing. A pending calendar confirmation is left
+**standing** when classification is unavailable: guessing "supersede" would
+silently cancel a destructive action the user is still waiting on. And the
+clarification check runs *before* the claim, because claiming consumes the
+question — failing after that would lose it permanently rather than letting the
+user answer again once the deployment is fixed.
+
+## 54. 4xx is a configuration problem; only 429 and 5xx are transient
+
+Three separate failures in one evening — a placeholder key (401), an exhausted
+credit balance (400), and a nonexistent bot token (404) — were each retried three
+times, and not one could have succeeded on the second attempt.
+
+The retry policy (§16) is right for a dependency blip and pure waste otherwise.
+Worse than waste: the user gets silence for the ~6s it takes to exhaust the
+attempts, and then still silence.
+
+`LlmRequestError` carries a `retryable` flag, set from the status. Non-retryable
+failures produce an honest reply immediately; 429 and 5xx still back off.
+
+The rate-limit case earned a further refinement. Gemini's 429 says *"Please retry
+in 19.79s"* — longer than the entire retry window — so all three attempts fired
+inside the period it had explicitly asked us to wait out. The provider's own
+`RetryInfo` is now parsed, and when the requested wait exceeds the window the
+user is told *"try again in about 20 seconds"* rather than being failed three
+times in private. Naming the wait is what makes it actionable.
+
+## 55. Two providers, and what the port abstraction was actually worth
+
+Anthropic and Gemini differ by roughly an order of magnitude in cost, and Gemini
+has a genuine free tier — which is what makes this system runnable by someone
+without a card. `LLM_PROVIDER` selects between them at boot.
+
+The interesting outcome was not the cost. `RouteClassifier` and `RagLlm` have
+been abstract since Phase 2 and 3, justified as "tests bind a fake" and "the
+model is swappable". The first half was exercised constantly; the second half was
+**an untested claim for two phases**. Writing a second implementation is what
+turned it into a fact — and it held: the swap needed no change to the router, the
+agents, the schemas, or any test.
+
+Two details worth recording. Gemini's `responseJsonSchema` accepts the existing
+JSON Schemas verbatim, so there is deliberately no translation layer to drift out
+of sync — the schema stays the single source of truth. And the prompts moved to
+`route-prompt.ts` and shared exports the moment there were two implementations:
+two copies of a prompt is two behaviours, and `eval:router` only ever exercises
+whichever one is bound, so a drift between them would surface as a routing bug
+with no obvious cause.
+
+`GeminiClient` is written against `fetch` rather than `@google/genai`. The
+surface used here is one endpoint and one response shape; a dependency shipping
+its own transport, retry, and auth stack is a poor trade for that, and it keeps
+the outbound seam obvious for the network guard (§31).
+
+The model is pinned by alias (`gemini-flash-lite-latest`) rather than version,
+which is not the usual preference. Pinned names return 404 for keys created after
+those models closed to new signups, so an alias is the only thing that works on a
+fresh key. `eval:router` is how a change under the alias gets caught. Flash-lite
+rather than flash because `gemini-flash-latest` currently allows **20 free
+requests per day**, which one testing session exhausts.
+
+## 56. The assistant could write to the calendar but not read it
+
+*"What's on my calendar tomorrow?"* routed to `unrelated`, and the model's own
+reason said precisely why: the assistant could create, move, and delete events
+but never look at them. It was right. `CALENDAR_ACTIONS` had no query action.
+
+The consequence was larger than a missing feature. That exact message is what the
+README tells a new user to send to connect their calendar, and the calendar agent
+is the only thing that sends OAuth links — so **onboarding was a dead end** for
+anyone starting fresh.
+
+Phase 4a caused it, in a way §50 half-predicted. The calendar agent's own keyword
+filter used to catch the word "calendar" and reply with a connect link *before*
+classifying anything, which accidentally covered a capability that never existed.
+Centralising classification removed the accident and exposed the real gap. That
+is the second bug the refactor exposed rather than introduced, and both were
+found only by using the system.
+
+`query_events` is read-only, so it skips every gate the write paths run through:
+no confirmation, no conflict check. It also skips the *completeness* gate, and
+that asymmetry is deliberate. `create_event` downgrades an incomplete request to
+a clarifying question because acting on a bad guess writes something wrong into a
+real calendar. A query writes nothing, so "what's on my calendar?" with no date
+defaults to the next 24 hours rather than interrogating the user.
+
+Queries carry an optional search term, reusing `eventQuery.titleContains` rather
+than adding a field — it already means "how to find an existing event". Without
+one, *"when is Sam's birthday?"* had nowhere to put its subject and collapsed
+into "what is on today", answering a question the user had not asked with three
+unrelated events. A search with no stated period gets a one-year window, because
+anything worth searching by name is often annual.
+
+## 57. Asking beats assuming, when asking is cheap
+
+The prompt instructed the model to "assume one hour if no duration was given".
+That invents a commitment length the user never chose, then blocks that slot
+against everything else — including reporting conflicts that are not real.
+
+`durationGiven` records what the user actually *said*, which is something the
+model can know, unlike how long a gym session ought to be. When it is false the
+agent asks, offering 30 minutes / 1 hour / 2 hours.
+
+**A reply keyboard, not inline buttons**, and the reasoning is structural rather
+than cosmetic. Tapping a reply keyboard sends an ordinary text message, so the
+answer arrives through the same webhook → queue → router → pending-action path as
+anything typed. Inline buttons post a `callback_query`, a different update type
+that the gateway schema, the job contract, and the router would each have to
+learn. The user-visible difference is small; the structural one is not.
+
+Parsing is deterministic, for the same reasons as §25's confirmation parser: the
+phrasings are few and closed, the user is waiting, and misreading "half an hour"
+as three hours books a real slot wrongly. The buttons offer three options; the
+parser accepts `45 mins`, `1h30`, `an hour and a half` and more, because a
+keyboard does not stop anyone typing. Anything that is not clearly a duration
+returns null and the question stands, so the router can still decide the user
+changed their mind.
+
+The answer goes through the conflict check like any other create. Skipping it
+would have made the duration prompt a way to book straight over an existing
+event.
+
+## 58. Three ways an event landed at the wrong time
+
+Time was where this system was weakest, and none of it was visible from the code.
+
+**The model was doing arithmetic we could do exactly.** The router sent
+`2026-07-22T20:43Z` plus "User timezone: Asia/Kolkata" and left the conversion to
+the model. After 18:30 IST, UTC is already on the previous date, so every "today"
+was a day behind — "add a dentist appointment today at 10am" landed on the wrong
+day.
+
+This one was **latent**, which is the part worth remembering. A stronger model
+did the conversion correctly; a cheaper one did not. The correctness of every
+date in the system rested on model strength rather than on code, and it surfaced
+only because the model was swapped for quota reasons. `formatZonedNow` now hands
+over the local wall-clock time and weekday directly — the answer, not the
+arithmetic.
+
+**The classifier was asked something it could not know.** "Move it to 5pm" moved
+a Friday event to Thursday, because the router never sees the event it is moving
+and a bare time can only anchor to today. No prompt wording fixes that; the
+information is not there. The first attempt at a fix *was* a prompt rule, and it
+failed exactly as it should have. `newDateGiven` records whether the user named a
+date, and the agent — which has resolved the event — rebases the time onto the
+event's own day, taking the offset from the target day so a DST boundary lands on
+the wall-clock time the user asked for.
+
+That the confirmation prompt names both the old and new time is the only reason
+this was caught rather than silently corrupting a calendar. Naming concrete
+values in a confirmation is worth the extra characters.
+
+**A guess was cached as if it were an answer.** Google's `events.list` did not
+report a timezone for one account, the client substituted a hardcoded `'UTC'`,
+and §24's caching wrote that guess onto the user row — where nothing could ever
+distinguish it from a real answer. A user in IST had every "11:30am" placed at
+17:00 on their own phone.
+
+The rule that came out of it: **never cache a fallback.** An absent timezone is
+now reported as absent, falls back to the *configured* default rather than a
+hardcoded one, is logged, and is not stored.
+
+`TIMEZONE_OVERRIDE` pins one zone for every user. It is a blunt instrument and
+knowingly temporary — correct for a single-region deployment, wrong the moment
+someone outside it connects. `/health` reports it, because a pinned deployment
+would otherwise just be quietly wrong for those users with nothing anywhere
+saying why.
+
+## 59. A dead script, and a test tier reading the developer's `.env`
+
+Two process failures, both invisible until something forced them into the open.
+
+`npm run eval:intent` had been failing to *compile* since Phase 4a: it imported
+the calendar's own classifier, which §50 deleted when the router took over
+classification. The README advertised it as a working command throughout. It was
+found by a typecheck during unrelated work, not by anyone running it — which says
+plainly that nobody had. Its distinctive fixtures moved into `eval:router`, which
+already prints extracted titles and times.
+
+Separately, the test tier inherits any variable `.env.test` does not set. Nest
+loads `.env` alongside it, so a `DEFAULT_TIMEZONE` in a developer's personal
+environment broke a test asserting the UTC fallback — and the same thing happened
+again with `TIMEZONE_OVERRIDE` an hour later. `.env.test` now sets every variable
+it depends on explicitly, blanking (`VAR=`) rather than omitting where it wants
+the default, and the schema treats an empty value as unset. Test outcomes must
+not depend on whose machine they run on.
+
+## What this pass says about the test suite
+
+594 tests passed throughout, including the whole time every one of these defects
+was live. That is not an indictment of the suite — it caught real regressions
+during these fixes, and the wire-schema/zod-schema agreement test caught a
+half-applied change within seconds. But it is worth being precise about what the
+suite does and does not cover.
+
+Every defect above lived in one of three places the fakes cannot reach:
+
+1. **What we send the model** — the UTC timestamp, the absent duration signal.
+   A scripted classifier accepts whatever it is given, so no test could notice.
+2. **What the provider sends back** — 400 with an empty balance, 429 with a
+   retry hint, an `events.list` with no timezone. The fakes return the happy
+   shape.
+3. **Whether a capability exists at all** — nothing tests for an action nobody
+   wrote.
+
+The mitigation is not more mocked tests. It is `eval:router` against the real
+API, and a real bot on a real calendar before believing any of it works.
+
+---
+
+## Still deferred after this pass
+
+Everything in "Still deferred after Phase 4a" stands. Added by this pass:
+
+- **The decline path is unverified against real Google.** "cancel my dentist
+  appointment" → "no" → the event survives is covered by integration tests but
+  has never been run for real. It is the most important safety behaviour here.
+- **`event_not_found` on phrasings that should resolve** — "shift meeting from
+  11 am to 9 am" failed to find a meeting that existed. Seen once in real logs,
+  not reproduced.
+- **Per-user timezones need a real source**, and a way for the user to correct
+  them (`set my timezone to …`). `TIMEZONE_OVERRIDE` is a stopgap.
+- **Only `primary` is read**, so Google's separate "Birthdays" calendar is
+  invisible — which makes "list all my birthdays" answer honestly but uselessly.
+- **The keyword pre-filter is miscalibrated in both directions**: it passes
+  "what is the capital of France?" to the model and dropped an entire message
+  because `calender` was misspelled. Common misspellings are covered now; the
+  general problem is not, and a drop is silent by nature (§26).
+- **A placeholder bot token is still retried like a transient failure.** §54's
+  reasoning applies, but unlike the router there is no honest fallback — without
+  a token there is no way to tell the user anything.

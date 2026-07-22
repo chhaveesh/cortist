@@ -31,9 +31,28 @@ export const pendingRescheduleSchema = z.object({
   timeZone: z.string(),
 });
 
+/**
+ * A create waiting on "how long?".
+ *
+ * Unlike the two above this is not a destructive action awaiting permission —
+ * it is a request awaiting a missing detail. It shares the pending-action slot
+ * because the mechanics are identical (one outstanding question per tenant, a
+ * TTL, replaced by a newer request) and because a user should never be holding
+ * two different unanswered questions from us at once.
+ */
+export const pendingDurationSchema = z.object({
+  type: z.literal('awaiting_duration'),
+  title: z.string(),
+  startTime: z.string(),
+  timeZone: z.string(),
+  location: z.string().optional(),
+  description: z.string().optional(),
+});
+
 export const pendingActionPayloadSchema = z.discriminatedUnion('type', [
   pendingDeleteSchema,
   pendingRescheduleSchema,
+  pendingDurationSchema,
 ]);
 
 export type PendingActionPayload = z.infer<typeof pendingActionPayloadSchema>;

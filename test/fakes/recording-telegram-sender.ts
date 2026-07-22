@@ -1,6 +1,8 @@
 export interface SentMessage {
   chatId: string;
   text: string;
+  /** Quick replies offered with the message, so tests can assert on them. */
+  quickReplies?: string[];
 }
 
 /**
@@ -17,12 +19,16 @@ export class RecordingTelegramSender {
   readonly sent: SentMessage[] = [];
   private failNext = false;
 
-  async sendMessage(chatId: string, text: string): Promise<void> {
+  async sendMessage(
+    chatId: string,
+    text: string,
+    options: { quickReplies?: string[]; clearKeyboard?: boolean } = {},
+  ): Promise<void> {
     if (this.failNext) {
       this.failNext = false;
       throw new Error('simulated Telegram failure');
     }
-    this.sent.push({ chatId, text });
+    this.sent.push({ chatId, text, quickReplies: options.quickReplies });
   }
 
   /** Simulate a Telegram outage on the next send. */

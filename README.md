@@ -693,6 +693,12 @@ Telegram to reach (e.g. `ngrok http 3000`, then set `PUBLIC_BASE_URL` and
    moved and kept its one-hour duration.
 7. **Delete** — "cancel my dentist appointment". Confirm it asks; reply "no" and
    check the event survives. Ask again, reply "yes", and confirm it's gone.
+   The **"no" branch is the one that matters** — a bare "no" classifies as
+   `unrelated`, so the pending-confirmation check has to run before
+   classification or every decline would strand its action (§25). Verified
+   end to end against real Google: "no" is handled before the model is called,
+   resolves the pending delete without issuing one, and leaves the event
+   untouched.
 8. **Token refresh** — leave it for over an hour (Google access tokens last
    ~1h), then send another calendar message. It should work without
    reconnecting. `docker compose logs worker | grep Refreshing` confirms the

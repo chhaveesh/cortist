@@ -28,7 +28,7 @@ macOS, Node 22.14, Docker 27.3.1, `LLM_PROVIDER=gemini`).
 | 1 — dockerized suite | ✅ passed | 45 suites / 594 tests, exit 0 |
 | 2 — live stack | ✅ passed | every check below |
 | 3 — model behaviour | ✅ passed | routing, extraction, and ambiguity verified against the live API |
-| 4 — real integrations | ⚠️ mostly | OAuth, query, create, conflict, reschedule, delete, RAG all verified. **The decline (`no`) path is still untested against real Google.** |
+| 4 — real integrations | ✅ passed | OAuth, query, search, create, duration prompt, conflict, reschedule, delete, **decline**, and RAG all verified against real Google. |
 
 Tier 1 breakdown:
 
@@ -397,7 +397,7 @@ docker compose exec postgres psql -U cortist -d cortist \
 | 4 | tap **30 minutes** | Now created, 11:30–12:00 |
 | 5 | ask for another event overlapping the dentist | Refusal naming the clash, and **no** second event |
 | 6 | "move my dentist appointment to 5pm" | Asks first, naming **both** times. Verify the calendar is unmoved, then reply "yes" → moves, duration preserved |
-| 7 | "cancel my dentist appointment" → **"no"** | **Event survives.** ⚠️ *This step has never been run against real Google* |
+| 7 | "cancel my dentist appointment" → **"no"** | **Event survives** — verified against real Google (see below) |
 | 8 | ask again → **"yes"** | Event gone |
 | 9 | "when is Sam's birthday?" | Searches a **year** by name — not a list of today's events |
 | 10 | "reschedule my call" with three calls | Lists them and asks which |
@@ -405,6 +405,20 @@ docker compose exec postgres psql -U cortist -d cortist \
 Step 6 is worth doing carefully: the confirmation names the old *and* new time,
 and that is the only reason defect #7 above was catchable rather than a silent
 corruption.
+
+**The decline path (step 7), verified 2026-07-23.** "cancel the doctor
+appointment" → *`Delete "doctor appointment" … Reply "yes" to confirm`* → "no".
+Three independent checks confirmed the event survived:
+
+- The worker logged `Calendar follow-up … : declined`. No `deleteEvent` call
+  and no `Deleted` confirmation followed — Google was never touched.
+- `pending_actions` was empty afterwards: "no" *consumed* the pending delete
+  rather than stranding it to expire or leaving it live for a stray later "yes".
+- "no" was handled by the follow-up path **before** classification, logged as
+  `follow_up`, never reaching the model. A bare "no" classifies as `unrelated`,
+  so the pending-confirmation check must run first, or every decline would
+  strand its action (DECISIONS.md §25). That ordering held under real
+  conditions.
 
 Two behaviours that are **by design**, not bugs:
 
@@ -553,13 +567,13 @@ Worth knowing before you file a bug against them.
 
 **Untested**
 
-- **The decline path.** "cancel my dentist appointment" → "no" has never been
-  run against real Google. It is covered by integration tests, but it is the
-  single most important safety behaviour in the system and deserves one real
-  run.
 - **`event_not_found` on phrasings that should resolve.** "shift meeting from
   11 am to 9 am" failed to find a meeting that existed. Seen once in real logs,
   not yet reproduced or diagnosed.
+
+*(The decline path — "cancel" → "no" → the event survives — was the other entry
+here until 2026-07-23, when it was verified against real Google. See the Tier 4
+walkthrough.)*
 
 **Real limitations**
 

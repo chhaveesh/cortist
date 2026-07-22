@@ -51,6 +51,8 @@ export class ScriptedRouteClassifier extends RouteClassifier {
           approximateEnd: '',
         },
         newStartTime: '',
+        durationGiven: true,
+        newDateGiven: false,
         newEndTime: '',
         clarifyingQuestion: '',
         contentToStore: '',

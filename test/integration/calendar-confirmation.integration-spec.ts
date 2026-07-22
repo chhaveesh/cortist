@@ -58,6 +58,7 @@ describe('Confirmation before destructive actions (integration)', () => {
     confidence: 'high' as const,
     eventQuery: deleteIntent.eventQuery,
     newStartTime: '2026-07-20T14:00:00Z',
+    newDateGiven: true,
   };
 
   describe('delete', () => {

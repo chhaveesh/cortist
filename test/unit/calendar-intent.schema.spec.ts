@@ -1,3 +1,4 @@
+import { rebaseOntoDayOf } from '../../src/agents/calendar/calendar-agent.service';
 import {
   CalendarExtraction,
   calendarExtractionJsonSchema,
@@ -18,6 +19,8 @@ function extraction(
     description: '',
     eventQuery: { titleContains: '', approximateStart: '', approximateEnd: '' },
     newStartTime: '',
+    durationGiven: true,
+    newDateGiven: false,
     newEndTime: '',
     clarifyingQuestion: '',
     ...overrides,
@@ -82,6 +85,7 @@ describe('narrowIntent', () => {
         title: 'Dentist',
         startTime: '2026-07-20T09:00:00+01:00',
         endTime: '2026-07-20T10:00:00+01:00',
+        durationGiven: true,
         location: 'Harley St',
       }),
     );
@@ -92,6 +96,7 @@ describe('narrowIntent', () => {
       title: 'Dentist',
       startTime: '2026-07-20T09:00:00+01:00',
       endTime: '2026-07-20T10:00:00+01:00',
+      durationGiven: true,
       location: 'Harley St',
     });
   });
@@ -226,5 +231,129 @@ describe('narrowIntent', () => {
       intent: 'not_calendar_related',
       confidence: 'low',
     });
+  });
+});
+
+/**
+ * query_events — the read-only action.
+ *
+ * Added after the router sent "what's on my calendar tomorrow?" to `unrelated`
+ * and the model explained exactly why: the assistant could create, move, and
+ * delete events, but not look at them. The README's own onboarding step relied
+ * on that message reaching the calendar agent, so a new user had no way to get
+ * an OAuth link.
+ */
+describe('query_events narrowing', () => {
+  function raw(overrides: Record<string, unknown> = {}) {
+    return {
+      intent: 'query_events',
+      confidence: 'high',
+      title: '',
+      startTime: '',
+      endTime: '',
+      location: '',
+      description: '',
+      eventQuery: {
+        titleContains: '',
+        approximateStart: '',
+        approximateEnd: '',
+      },
+      newStartTime: '',
+      newEndTime: '',
+      clarifyingQuestion: '',
+      ...overrides,
+    } as never;
+  }
+
+  it('keeps a window the model supplied', () => {
+    const intent = narrowIntent(
+      raw({
+        startTime: '2026-07-24T00:00:00+05:30',
+        endTime: '2026-07-25T00:00:00+05:30',
+      }),
+    );
+
+    expect(intent).toEqual({
+      intent: 'query_events',
+      confidence: 'high',
+      startTime: '2026-07-24T00:00:00+05:30',
+      endTime: '2026-07-25T00:00:00+05:30',
+    });
+  });
+
+  /**
+   * The opposite of the create/reschedule/delete gates, deliberately. Those
+   * downgrade an incomplete request to a question because acting on a bad guess
+   * writes something wrong into a real calendar. A query writes nothing, so an
+   * empty window is a normal request and the agent defaults it.
+   */
+  it('does not demand a window', () => {
+    const intent = narrowIntent(raw());
+
+    expect(intent.intent).toBe('query_events');
+    expect(intent).not.toHaveProperty('startTime');
+    expect(intent).not.toHaveProperty('endTime');
+  });
+
+  it('accepts a start with no end', () => {
+    const intent = narrowIntent(raw({ startTime: '2026-07-24T00:00:00Z' }));
+
+    expect(intent).toEqual({
+      intent: 'query_events',
+      confidence: 'high',
+      startTime: '2026-07-24T00:00:00Z',
+    });
+  });
+});
+
+/**
+ * Rebasing a bare time onto the event's own day.
+ *
+ * The bug this fixes, observed against a real calendar on 2026-07-23: "move my
+ * dentist appointment to 5pm" was proposed as a move from Fri 24 Jul 15:00 to
+ * *Thu 23 Jul* 17:00 — a day earlier. The classifier is asked for an absolute
+ * timestamp but never sees the event, so "5pm" can only anchor to today. The
+ * agent knows the event, so the arithmetic belongs there.
+ */
+describe('rebaseOntoDayOf', () => {
+  it('keeps the event on its own day', () => {
+    // Event on Fri 24 Jul; model said 5pm and anchored to Thu 23 Jul.
+    expect(
+      rebaseOntoDayOf(
+        '2026-07-24T15:00:00+05:30',
+        '2026-07-23T17:00:00+05:30',
+        'Asia/Kolkata',
+      ),
+    ).toBe('2026-07-24T17:00:00+05:30');
+  });
+
+  it('works when the event and the guess are in different UTC days', () => {
+    // 24 Jul 23:30 IST is still 24 Jul locally but 18:00 UTC — the rebase must
+    // use the user's calendar day, not UTC's.
+    expect(
+      rebaseOntoDayOf(
+        '2026-07-24T23:30:00+05:30',
+        '2026-07-23T09:00:00+05:30',
+        'Asia/Kolkata',
+      ),
+    ).toBe('2026-07-24T09:00:00+05:30');
+  });
+
+  it('carries the target day’s offset, not the guess’s', () => {
+    // London in July is BST (+01:00).
+    expect(
+      rebaseOntoDayOf(
+        '2026-07-24T15:00:00+01:00',
+        '2026-07-23T17:00:00+01:00',
+        'Europe/London',
+      ),
+    ).toBe('2026-07-24T17:00:00+01:00');
+  });
+
+  it('falls back to the model’s timestamp on an unusable input', () => {
+    // A bad date must not turn a reschedule into an error.
+    expect(
+      rebaseOntoDayOf('not-a-date', '2026-07-23T17:00:00Z', 'Asia/Kolkata'),
+    ).toBe('2026-07-23T17:00:00Z');
   });
 });

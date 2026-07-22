@@ -41,6 +41,7 @@ describe('Concurrent calendar requests for one tenant (integration)', () => {
     title,
     startTime: start,
     endTime: end,
+    durationGiven: true,
   });
 
   it('creates distinct events for distinct non-overlapping requests', async () => {

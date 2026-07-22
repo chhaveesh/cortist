@@ -1,5 +1,5 @@
 /**
- * Manual router evaluation against the REAL Anthropic API.
+ * Manual router evaluation against the REAL provider API (LLM_PROVIDER).
  *
  * Deliberately outside CI, for the same reasons as eval-intent.ts: it costs
  * money, needs a key, and its ambiguous cases are judgement calls. The
@@ -18,6 +18,8 @@
 import { config } from 'dotenv';
 import { resolve } from 'node:path';
 import { ConfigService } from '@nestjs/config';
+import { GeminiClient } from '../src/llm/gemini.client';
+import { GeminiRouteClassifier } from '../src/router/intent/gemini-route-classifier.service';
 import { AnthropicRouteClassifier } from '../src/router/intent/route-classifier.service';
 import { RouteName } from '../src/router/intent/route-intent.schema';
 import { looksActionable } from '../src/router/intent/router-keyword-filter';
@@ -91,12 +93,49 @@ const FIXTURES: Fixture[] = [
     expect: 'ambiguous',
     ambiguous: true,
   },
+  // --- calendar extraction ambiguity, inherited from the retired eval:intent
+  // These are calendar fixtures whose *extraction* is the interesting part, not
+  // the route. Phase 4a merged routing and extraction into one call, so the
+  // printed title and startTime below are what they are here to exercise.
+  {
+    text: 'book something for 9',
+    expect: 'calendar',
+    ambiguous: true,
+    note: '9am or 9pm? Guessing puts a real event in the wrong half of the day. Watch whether it asks rather than picks.',
+  },
+  {
+    text: 'set up a meeting at 3 for the New York folks',
+    expect: 'calendar',
+    ambiguous: true,
+    note: "3pm in whose timezone? The user's, or New York's?",
+  },
+  {
+    text: 'shift my morning around',
+    expect: 'calendar',
+    ambiguous: true,
+    note: 'Underspecified: no event, no target time. Should resolve to a clarification rather than a guess.',
+  },
+  {
+    text: 'schedule a 30 minute sync with Priya on Wednesday morning',
+    expect: 'calendar',
+    note: 'Check the duration is 30 minutes, not the default hour.',
+  },
+  {
+    text: 'push the Priya sync back an hour',
+    expect: 'calendar',
+    note: 'Relative reschedule — needs an eventQuery, not a start time.',
+  },
 ];
 
 async function main(): Promise<void> {
-  if (!process.env.ANTHROPIC_API_KEY) {
+  const keyVar =
+    (process.env.LLM_PROVIDER ?? 'gemini') === 'gemini'
+      ? 'GEMINI_API_KEY'
+      : 'ANTHROPIC_API_KEY';
+
+  if (!process.env[keyVar]) {
     console.error(
-      'ANTHROPIC_API_KEY is not set. This script calls the real API — set it in .env first.',
+      `${keyVar} is not set. This script calls the real API — set it in .env first.`,
     );
     process.exit(2);
   }
@@ -105,12 +144,25 @@ async function main(): Promise<void> {
   const fixtures =
     only === 'ambiguous' ? FIXTURES.filter((f) => f.ambiguous) : FIXTURES;
 
-  const classifier = new AnthropicRouteClassifier({
+  // Mirrors the runtime binding in router.module.ts, so this evaluates
+  // whichever provider the deployment actually uses rather than a fixed one.
+  const config = {
     get: (key: string) => process.env[key],
-  } as unknown as ConfigService<never, true>);
+  } as unknown as ConfigService<never, true>;
+
+  const provider = process.env.LLM_PROVIDER ?? 'gemini';
+  const model =
+    provider === 'gemini'
+      ? (process.env.GEMINI_MODEL ?? 'gemini-flash-latest')
+      : (process.env.ANTHROPIC_MODEL ?? 'claude-haiku-4-5');
+
+  const classifier =
+    provider === 'gemini'
+      ? new GeminiRouteClassifier(new GeminiClient(config))
+      : new AnthropicRouteClassifier(config);
 
   console.log(
-    `\nRouting ${fixtures.length} fixtures via ${process.env.ANTHROPIC_MODEL ?? 'claude-haiku-4-5'}`,
+    `\nRouting ${fixtures.length} fixtures via ${model} (${provider})`,
   );
   console.log(`Anchored at ${NOW.toISOString()} (${TIMEZONE})\n`);
 

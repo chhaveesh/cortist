@@ -36,6 +36,7 @@ describe('Calendar create + conflict detection (integration)', () => {
     title: 'Dentist',
     startTime: start,
     endTime: end,
+    durationGiven: true,
   });
 
   it('creates the event when the slot is free, and confirms it', async () => {

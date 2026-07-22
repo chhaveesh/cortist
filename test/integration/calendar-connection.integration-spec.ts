@@ -34,6 +34,7 @@ describe('Calendar connection prompts (integration)', () => {
       title: 'Dentist',
       startTime: '2026-07-20T09:00:00Z',
       endTime: '2026-07-20T10:00:00Z',
+      durationGiven: true,
     });
     const outcome = await routeToCalendar(
       harness,
@@ -80,6 +81,7 @@ describe('Calendar connection prompts (integration)', () => {
       title: 'Dentist',
       startTime: '2026-07-20T09:00:00Z',
       endTime: '2026-07-20T10:00:00Z',
+      durationGiven: true,
     });
 
     const outcome = await routeToCalendar(
@@ -119,6 +121,7 @@ describe('Calendar connection prompts (integration)', () => {
         title: 'Dentist',
         startTime: '2026-07-20T09:00:00Z',
         endTime: '2026-07-20T10:00:00Z',
+        durationGiven: true,
       });
       const outcome = await routeToCalendar(
         harness,
@@ -148,6 +151,7 @@ describe('Calendar connection prompts (integration)', () => {
       title: 'Dentist',
       startTime: '2026-07-20T09:00:00Z',
       endTime: '2026-07-20T10:00:00Z',
+      durationGiven: true,
     });
 
     const outcome = await routeToCalendar(

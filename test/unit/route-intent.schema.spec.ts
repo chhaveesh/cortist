@@ -21,6 +21,8 @@ function extraction(overrides: Partial<RouteExtraction> = {}): RouteExtraction {
     description: '',
     eventQuery: { titleContains: '', approximateStart: '', approximateEnd: '' },
     newStartTime: '',
+    durationGiven: true,
+    newDateGiven: false,
     newEndTime: '',
     contentToStore: '',
     question: '',

@@ -18,7 +18,7 @@ import { looksActionable } from '../../src/router/intent/router-keyword-filter';
  * tested exactly. Whether the *model* assigns the right confidence and
  * alternative to a given phrasing is its judgement, and no mock can verify it —
  * each fixture below therefore records the classification a careful human would
- * expect, and `npm run eval:intent` is where that expectation meets reality.
+ * expect, and `npm run eval:router` is where that expectation meets reality.
  */
 
 function extraction(overrides: Partial<RouteExtraction> = {}): RouteExtraction {
@@ -35,6 +35,8 @@ function extraction(overrides: Partial<RouteExtraction> = {}): RouteExtraction {
     description: '',
     eventQuery: { titleContains: '', approximateStart: '', approximateEnd: '' },
     newStartTime: '',
+    durationGiven: true,
+    newDateGiven: false,
     newEndTime: '',
     clarifyingQuestion: '',
     contentToStore: '',
@@ -113,6 +115,57 @@ const CONFIDENTLY_CLASSIFIABLE: Array<{
     why: 'unambiguous calendar verb and object',
   },
 ];
+
+/**
+ * `unrelated` as a runner-up must never trigger a question.
+ *
+ * Observed live on 2026-07-23: "what's the API rate limit?" came back
+ * rag_query at medium confidence with `unrelated` as the alternative, so the
+ * router asked "did you mean a question about your saved documents, or
+ * something else?". That is not a choosable question — the user replied "yes",
+ * which parses as neither option, and the router gave up. Three messages spent
+ * to not answer a question it had routed correctly on the first one.
+ */
+describe('unrelated is not a choosable alternative', () => {
+  it('does not ask when the runner-up is unrelated', () => {
+    const raw = extraction({
+      route: 'rag_query',
+      confidence: 'medium',
+      alternative: 'unrelated',
+      question: "what's the API rate limit?",
+    });
+
+    expect(isAmbiguous(raw)).toBe(false);
+    // Routes to its first choice; a miss is the agent's to handle, and the
+    // RAG agent already declines honestly when it finds nothing relevant.
+    expect(narrowRoute(raw).route).toBe('rag_query');
+  });
+
+  it('does not ask when the primary is unrelated', () => {
+    // The mirror case: "I can't help with this, but maybe calendar?" is not a
+    // choice between two capabilities either.
+    const raw = extraction({
+      route: 'unrelated',
+      confidence: 'low',
+      alternative: 'calendar',
+    });
+
+    expect(isAmbiguous(raw)).toBe(false);
+    expect(narrowRoute(raw).route).toBe('unrelated');
+  });
+
+  it('still asks between two real capabilities', () => {
+    // The narrowing must not have disabled ambiguity generally.
+    const raw = extraction({
+      route: 'calendar',
+      confidence: 'medium',
+      alternative: 'rag_query',
+    });
+
+    expect(isAmbiguous(raw)).toBe(true);
+    expect(narrowRoute(raw).route).toBe('ambiguous');
+  });
+});
 
 describe('ambiguity detection', () => {
   describe('genuinely ambiguous phrasings', () => {
